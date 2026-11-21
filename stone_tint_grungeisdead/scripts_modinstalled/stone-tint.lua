@@ -405,6 +405,29 @@ local dw_colour            -- its colour module; nil not looked up yet, false no
 local dw_look              -- the look key it showed when last checked
 local dw_filed = {}        -- copy texpos -> DF's own texpos, for each copy filed in known_texpos
 
+-- BOTH DETAILED WEATHERS (2026-11-20). copy_of and shown_look are grungeisdead's copy's own; Poss's
+-- releases (1.4, 1.5) have neither, so with his every call failed (in pcall), no copy was ever filed,
+-- and floors went untinted whenever his look wasn't the game's own. Both keep the same state, read
+-- here when the functions aren't there: state.shown, the key of the look showing (nil: the game's
+-- own), and state.copies[key][original] = {handle, texpos}, its copy (colour.lua in both).
+-- The texpos showing for DF's own `original` now: its copy in the look showing, or itself.
+local function dw_live_copy(mod, original)
+    if type(mod.copy_of) == 'function' then return mod.copy_of(original) end
+    local st = mod.state
+    local set = st and st.shown and st.copies and st.copies[st.shown]
+    local copy = set and set[original]
+    return copy and copy.texpos or original
+end
+-- The key of the look showing (false: the game's own, or none known).
+local function dw_shown_key(mod)
+    if type(mod.shown_look) == 'function' then
+        local _, key = mod.shown_look()
+        return key or false
+    end
+    local st = mod.state
+    return st and st.shown or false
+end
+
 -- Detailed Weather's colour module, or false. Looked up only once its global
 -- table exists, so nothing of it is loaded when it is not installed.
 local function dw_module()
@@ -426,7 +449,7 @@ local function dw_floor(drawn)
     if id == nil then return nil end
     local mod = dw_module()
     if not mod then return nil end
-    local ok, live = pcall(mod.copy_of, original)
+    local ok, live = pcall(dw_live_copy, mod, original)
     if not ok or live ~= drawn then return nil end
     dw_filed[drawn] = original
     return id
@@ -437,7 +460,7 @@ end
 local function dw_check_look()
     local mod = dw_colour
     if not mod then return end   -- not looked up or not running: nothing filed
-    local ok, _, key = pcall(mod.shown_look)
+    local ok, key = pcall(dw_shown_key, mod)
     key = ok and key or false
     if key == dw_look then return end
     dw_look = key
@@ -1231,13 +1254,18 @@ local function find_overlay_slots()
     end
     local slots = {}
     if not any then return slots end
+    -- (BOTH DETAILED WEATHERS, 2026-11-20) while Detailed Weather shows a look of its own, an overlay's
+    -- entries hold its copy, which no overlay page holds: found through its record of what each copy
+    -- it points the tables at was made from (detailed_weather_pointed_from, in both its versions).
+    -- Only Detailed Weather writes its copies into these tables, so a match is always one of its own.
+    local from = rawget(_G, 'detailed_weather_pointed_from')
     local gps = df.global.gps
     for _, name in ipairs(TEXTURE_TABLES) do
         local ok, arr = pcall(function() return gps[name] end)
         if ok and arr then
             for i = 0, #arr - 1 do
                 local v = arr[i]
-                if wanted[v] then slots[#slots + 1] = {name, i, v} end
+                if wanted[v] or (from and from[v] and wanted[from[v]]) then slots[#slots + 1] = {name, i, v} end
             end
         end
     end
