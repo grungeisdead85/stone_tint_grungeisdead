@@ -34,6 +34,10 @@ local STRENGTHS = {0, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100}
 -- each value as a key, to check a saved or typed one.
 local TINT_STYLES = {{'keep', 'Keep texture'}, {'smooth', 'Smooth'}, {'classic', 'Classic'},
     keep=true, smooth=true, classic=true}
+-- What "Ramp overlays" can be (RAMP OVERLAYS), in the window's order as
+-- {value, label}, and each value as a key.
+local OVERLAY_MODES = {{'tinted', 'Tinted'}, {'hidden', 'Hidden'}, {'shown', 'As drawn'},
+    tinted=true, hidden=true, shown=true}
 local GLOBAL_KEY = 'stone-tint'
 local CELL_PX = 32
 -- New textures made per frame at most. The first sight of a material makes one
@@ -47,11 +51,11 @@ local NEW_TEXTURES_PER_FRAME = 12
 -- ==========================================
 -- Vanilla's floor, stair and ramp art as Lua data, written by
 -- build_stone_tint_art.py. Each pixel carries its key column, the palette
--- column its tint blends toward. Tiles are now tinted from the picture DF
--- actually drew (THE ART AS DRAWN), so this is what engraved floors are drawn
--- from, what a picture that cannot be read falls back to, and where ramp cells
--- are worked out from the walls (RAMP_CELL). It is still required: without it
--- nothing is tinted.
+-- column its tint blends toward. Tiles are tinted from the picture DF actually
+-- drew (THE ART AS DRAWN), so this is what a picture that cannot be read falls
+-- back to, how vanilla's engraving is known (and drawn without its face:
+-- ENGRAVED FLOORS BY THE MAP), and where ramp cells are worked out from the
+-- walls (RAMP_CELL). It is still required: without it nothing is tinted.
 local ok_art, art = pcall(reqscript, 'stone-tint/art-vanilla')
 if not ok_art or type(art) ~= 'table' or not art.CELLS then
     dfhack.printerr('stone-tint: could not load stone-tint/art-vanilla.lua; nothing will be tinted')
@@ -114,113 +118,78 @@ end
 local ART_COUNT = #ART_CELL
 
 -- ==========================================
--- FLOORS: LOOKED UP ON THE TILE PAGES
+-- TILES BY THE MAP
 -- ==========================================
--- DF draws floors straight off their tile page, so their texposes are found by
--- page and cell. This order must match ids 1 to 13 above.
-local VARIANTS = {
-    {'DETAILED_FLOORS', 0, 3}, {'DETAILED_FLOORS', 1, 3}, {'DETAILED_FLOORS', 2, 3},
-    {'DETAILED_FLOORS', 0, 4}, {'DETAILED_FLOORS', 1, 4}, {'DETAILED_FLOORS', 2, 4},
-    {'DETAILED_FLOORS', 0, 5}, {'DETAILED_FLOORS', 1, 5}, {'DETAILED_FLOORS', 2, 5},
-    {'DETAILED_ALT_FLOORS', 7, 4}, {'DETAILED_ALT_FLOORS', 7, 5}, {'DETAILED_ALT_FLOORS', 7, 6},
-    {'FLOORS', 6, 3},
-}
-local VANILLA_VARIANTS = {
-    {'FLOORS', 0, 3}, {'FLOORS', 1, 3}, {'FLOORS', 2, 3},
-    {'FLOORS', 0, 4}, {'FLOORS', 1, 4}, {'FLOORS', 2, 4},
-    {'FLOORS', 0, 5}, {'FLOORS', 1, 5}, {'FLOORS', 2, 5},
-    {'ALT_FLOORS', 7, 4}, {'ALT_FLOORS', 7, 5}, {'ALT_FLOORS', 7, 6},
-}
--- Detailed Landscapes 2.3 and later (Rounded Hills) draws STONE_FLOOR_* and
--- DIRT_FLOOR_* off pages of its own, at the same cells as vanilla's: its
--- graphics_tiles_rounded_hills.txt names FLOORS_ROUND_DETAILED 0:3 to 2:8 and
--- ALT_FLOORS_ROUND_DETAILED 7:4 to 7:9. Its DETAILED_FLOORS pages now carry
--- only GRASS_* tokens, so the DETAILED_ entries in VARIANTS above match
--- nothing DF draws, and stone and soil floors went untinted. Read off DL 2.4's
--- raws 2026-11-15. Stone floors match ids 1 to 12, soil floors 14 to 25.
-local ROUND_VARIANTS = {
-    {'FLOORS_ROUND_DETAILED', 0, 3}, {'FLOORS_ROUND_DETAILED', 1, 3}, {'FLOORS_ROUND_DETAILED', 2, 3},
-    {'FLOORS_ROUND_DETAILED', 0, 4}, {'FLOORS_ROUND_DETAILED', 1, 4}, {'FLOORS_ROUND_DETAILED', 2, 4},
-    {'FLOORS_ROUND_DETAILED', 0, 5}, {'FLOORS_ROUND_DETAILED', 1, 5}, {'FLOORS_ROUND_DETAILED', 2, 5},
-    {'ALT_FLOORS_ROUND_DETAILED', 7, 4}, {'ALT_FLOORS_ROUND_DETAILED', 7, 5},
-    {'ALT_FLOORS_ROUND_DETAILED', 7, 6},
-}
-local ROUND_SOIL_VARIANTS = {
-    {'FLOORS_ROUND_DETAILED', 0, 6}, {'FLOORS_ROUND_DETAILED', 1, 6}, {'FLOORS_ROUND_DETAILED', 2, 6},
-    {'FLOORS_ROUND_DETAILED', 0, 7}, {'FLOORS_ROUND_DETAILED', 1, 7}, {'FLOORS_ROUND_DETAILED', 2, 7},
-    {'FLOORS_ROUND_DETAILED', 0, 8}, {'FLOORS_ROUND_DETAILED', 1, 8}, {'FLOORS_ROUND_DETAILED', 2, 8},
-    {'ALT_FLOORS_ROUND_DETAILED', 7, 7}, {'ALT_FLOORS_ROUND_DETAILED', 7, 8},
-    {'ALT_FLOORS_ROUND_DETAILED', 7, 9},
-}
--- DIRT_FLOOR_1 to 9 and 5B to 5D, matching ids 14 to 25. Sand has pages of its
--- own (FLOOR_SAND), so sand floors never match these and keep DF's look.
-local SOIL_VARIANTS = {
-    {'FLOORS', 0, 6}, {'FLOORS', 1, 6}, {'FLOORS', 2, 6},
-    {'FLOORS', 0, 7}, {'FLOORS', 1, 7}, {'FLOORS', 2, 7},
-    {'FLOORS', 0, 8}, {'FLOORS', 1, 8}, {'FLOORS', 2, 8},
-    {'ALT_FLOORS', 7, 7}, {'ALT_FLOORS', 7, 8}, {'ALT_FLOORS', 7, 9},
-}
+-- (v1.2.0, 2026-11-21) Which tiles are tinted is read off the map, never off
+-- a tile page: a revealed natural tile of stone (STONE, MINERAL, FEATURE,
+-- LAVA_STONE) or soil (SOIL, sand excepted), shaped as a floor (a boulder's
+-- tile too: DF draws its floor under it), a stair or a ramp (WHAT A TILE IS).
+-- Whatever picture DF drew in that tile's ground layer is tinted (THE ART AS
+-- DRAWN), whichever graphics drew it: vanilla's, Detailed Landscapes', Detailed
+-- Weather's look copies, a mod's own floors or engravings. Until v1.1 floors
+-- and engraved floors were found by their tile pages, by name (FLOORS,
+-- ALT_FLOORS, DETAILED_FLOORS, FLOORS_ROUND_DETAILED and the two engraved
+-- floor pages), so graphics drawing them off any other page went untinted.
+--
+-- A floor is rough, smooth (tiletype special SMOOTH) or engraved (smooth, with
+-- an engraving on its floor), each with its own switch. The art id a kind gets
+-- picks the switch and the count, and the stored picture drawn when DF's
+-- cannot be read: vanilla's main floor (stone_floor_5, soil_floor_5), its
+-- smooth floor, or its engraving.
+local KIND_ART = {rough_stone = 5, rough_soil = FIRST_SOIL_FLOOR + 4, smooth = 13}
 
 -- ==========================================
--- ENGRAVED FLOORS: LOOKED UP ON THEIR PAGES
+-- ENGRAVED FLOORS BY THE MAP
 -- ==========================================
--- Vanilla has two one-cell pages for an engraved stone floor.
--- FLOOR_STONE_ENGRAVED_PALETTE is drawn in four colours that are all palette
--- row 0 keys (columns 12 to 15), the mark of art DF recolours by palette.
--- FLOOR_STONE_ENGRAVED_NON_PALETTE is seven fixed blue-greys, none of them a
--- row 0 key, so no stone's colour can reach it. It was cut into vanilla's
--- smooth floor: outside the carving, every pixel is the smooth floor's own
--- (FLOORS 6:3, 468 of 1024 equal). Seen in play 2026-10-21: an engraved
--- claystone floor (CHOCOLATE) showed NON_PALETTE's blue-greys, 104,110,114 the
--- commonest pixel, beside an engraved claystone wall in the stone's brown. So
--- DF drew that natural engraved floor in the fixed art, not its stone's
--- colour, and it read as plain blue next to tinted floors.
+-- A natural stone floor is engraved when an engraving (world.event.engravings)
+-- is on its floor (flags.floor). The engravings are filed by level, the files
+-- made again whenever their number changes (checked once a frame:
+-- engravings.refresh).
 --
--- stone-tint draws the NON_PALETTE cell in its place, keyed by luminance like
--- every other floor so it tints the same way as the floor around it, or the
--- same cell with the face carved out (engraved_floor_plain.png, see
--- build_stone_tint_art.py), as the "Engraving faces" switch says.
---
--- NOT YET MEASURED (2026-10-21): that DF puts the engraved page tile in
--- screentexpos_background, the way it does the smooth floor, rather than
--- drawing it over the floor from a flag, the way the ramp overlays come (RAMP
--- OVERLAYS). `stone-tint status` counts the engraved tiles drawn: none while
--- engraved floors are on screen means it does not. Both pages are looked up,
--- in case DF ever draws the PALETTE cell unswapped.
-local ENGRAVED_PAGES = {
-    {'FLOOR_STONE_ENGRAVED_NON_PALETTE', 0, 0},
-    {'FLOOR_STONE_ENGRAVED_PALETTE', 0, 0},
-}
--- Marks an engraved floor's page tile in floor_texpos and known_texpos. Not an
--- art id: whether the tile is natural stone is checked once per tile
--- (natural_engraved), and which picture it gets is the switch, read per frame.
-local ENGRAVED = -2
+-- Vanilla draws a natural engraved floor with FLOOR_STONE_ENGRAVED_NON_PALETTE,
+-- seven fixed blue-greys cut into its smooth floor, not in the stone's colour
+-- (seen in play 2026-10-21: an engraved claystone floor showed them, 104,110,114
+-- the commonest pixel, beside an engraved claystone wall in the stone's brown).
+-- Tinted as drawn like every other picture, it moves toward the stone's colour
+-- the way the floor round it does, and so does any graphics' own engraving.
+-- The "Engraving faces" switch can only carve the face out of a picture it
+-- knows: when DF's picture is vanilla's engraving (all its pixels the same as
+-- our stored copy's: engravings.vanilla; read off Detailed Weather's original
+-- while one of its looks shows), the switch off draws our copy without the
+-- face (engraved_floor_plain.png, see build_stone_tint_art.py). Any other
+-- engraving keeps its picture whole.
+local ENGRAVED = -2    -- what a natural engraved floor is (its picture: the switch's, per tile)
+-- by_level[z][x][y] = true for each engraved floor; count: the engravings
+-- filed (-1: none yet); vanilla_hash: read_source's hash of our stored copy of
+-- vanilla's engraving (nil: not worked out yet, false: no stored copy).
+-- Functions (refresh, at, vanilla) are added below, once what they use exists.
+local engravings = {count = -1, by_level = {}}
 
 -- ==========================================
 -- STAIRS AND RAMPS: LEARNED FROM THE MAP
 -- ==========================================
--- DF does not draw natural stairs or ramps off a tile page, so they cannot be
--- looked up the way floors are. Measured with stone-tint-stair-probe and
--- stone-tint-ramp-probe: every stone, mineral and soil stair and every stone
--- and mineral ramp held a texture in screentexpos_background that is on no
--- tile page, one per material and shape (every pyrite up-stair on screen shared
--- one; three tetrahedrite ramps against different walls had three), and no
--- other layer held anything for them. Grass stairs alone came straight off the
--- STAIRS page. The run-time textures were renumbered between runs along with
--- the pages. So the overlay learns them from the map instead (natural_art and
--- the render loop) and draws vanilla's art in their place: STAIRS rows 1 and 2
--- for stairs, STONE_RAMPS and SOIL_RAMPS for ramps.
+-- DF does not draw natural stairs or ramps off a tile page. Measured with
+-- stone-tint-stair-probe and stone-tint-ramp-probe: every stone, mineral and
+-- soil stair and every stone and mineral ramp held a texture in
+-- screentexpos_background that is on no tile page, one per material and shape
+-- (every pyrite up-stair on screen shared one; three tetrahedrite ramps against
+-- different walls had three), and no other layer held anything for them. Grass
+-- stairs alone came straight off the STAIRS page. The run-time textures were
+-- renumbered between runs along with the pages. They were the first tiles read
+-- off the map; since v1.2 every tile is (TILES BY THE MAP). Our stored copies of
+-- vanilla's STAIRS rows 1 and 2, STONE_RAMPS and SOIL_RAMPS are their fallback.
 --
 -- A ramp's picture depends on which of its 8 neighbours are walls. DF works
 -- that out itself and leaves it in screentexpos_ramp_flag, bits 8 to 15 in the
--- order N, W, E, S, NW, NE, SW, SE (the layout devel/inspect-screen decodes),
--- so the overlay reads DF's own answer rather than working it out again, and
--- art.RAMP_CELL turns it into the vanilla cell. The probe's ramps decoded as a
--- column against a west wall: N_W, W, S_W. The probe found nothing of the ramp
--- overlays or shadows (vanilla's or Dark Depths') in any texpos layer, and in
--- play Dark Depths' ramp overlay drew on top of our tinted ramps: DF draws
--- those from the flags after the background. The overlay is hidden separately
--- (RAMP OVERLAYS, below); the shadows stay.
+-- order N, W, E, S, NW, NE, SW, SE (the layout devel/inspect-screen decodes,
+-- and DF's own VIEWPORT_RAMP_FLAG_WALL_*), so the overlay reads DF's answer
+-- rather than working it out again, and art.RAMP_CELL turns it into the
+-- vanilla cell. The probe's ramps decoded as a column against a west wall:
+-- N_W, W, S_W. The probe found nothing of the ramp overlays or shadows
+-- (vanilla's or Dark Depths') in any texpos layer, and in play Dark Depths'
+-- ramp overlay drew on top of our tinted ramps: DF draws those from the flags
+-- after the background. The overlay is drawn into the ramp's picture here
+-- instead (RAMP OVERLAYS, below); the shadows stay.
 local STAIR_SHAPES = {
     [df.tiletype_shape.STAIR_UPDOWN] = 'updown',
     [df.tiletype_shape.STAIR_UP] = 'up',
@@ -234,8 +203,9 @@ local STONE_MATERIALS = {
     [df.tiletype_material.FEATURE] = true,
     [df.tiletype_material.LAVA_STONE] = true,
 }
--- Marks a texture DF drew on a natural stair or ramp in known_texpos (below).
-local LEARNED = -1
+-- What any other ramp is (grass, sand, a construction, ice): not tinted, but
+-- given its overlay (RAMP OVERLAYS).
+local RAMP_OTHER = -3
 
 -- ==========================================
 -- THE LEVELS BELOW
@@ -264,30 +234,29 @@ local LOWER_LEVELS = 8
 -- ==========================================
 -- STATE
 -- ==========================================
--- texpos of a pristine game floor sprite -> art id, or ENGRAVED for an
--- engraved floor's page tile. Small (<= 39 entries).
-local floor_texpos = {}
--- How many of ENGRAVED_PAGES were found on a loaded page, for `stone-tint status`.
-local engraved_found = 0
--- Every texpos the floor buffers have shown since the last reset, filed once:
--- a floor art id, LEARNED, ENGRAVED, or false for anything that is not ours. One table
--- for every level, since a texture means the same thing at any depth, so the
--- common cell costs one lookup. Rebuilt from the floor sprites on every z
--- change, and when the floor sprites or our textures move, because DF
--- renumbers its run-time textures when it reloads them.
+-- Every texpos the ground layers have shown since the last reset, filed at its
+-- first sight by the tile it was on (WHAT A TILE IS): false when no picture on
+-- a tile like that one is ever ours (a wall, open space, grass), so it is never
+-- looked at again; true otherwise, and every tile showing it is read off the
+-- map once (tile_checks). One table for every level, so the common cell costs
+-- one lookup. Emptied on every change of level, when DF's textures move and
+-- when Detailed Weather's look changes: DF renumbers its run-time textures as
+-- it draws, and Detailed Weather frees a look's copies.
 local known_texpos = {}
 local cached_z
 -- Per level, since the levels below are drawn too. Both are kept while their
 -- level is near the view (change_level) and emptied on a map load.
 local color_cache = {}          -- [z] = {[world_x] = {[world_y] = colour code}}
--- [z] = {[world_x] = {[world_y] = {texpos=, id=}}}: what a learned stair or
--- ramp tile is, or whether an engraved floor is natural stone (ENGRAVED or
--- false), checked against the texture DF drew there, so a tile goes back to
--- the map only when its picture changes.
+-- [z] = {[world_x] = {[world_y] = {texpos=, id=, never=, under=}}}: what a
+-- tile is (an art id, ENGRAVED, RAMP_OTHER or false, and whether no picture on
+-- a tile like it is ever ours: WHAT A TILE IS) and, under one of Detailed
+-- Weather's copies, whether it is subterranean, checked against the texture DF
+-- drew there (a copy's original), so a tile goes back to the map only when its
+-- picture changes.
 local tile_checks = {}
 local map_max_x, map_max_y      -- tile bounds, refreshed on map load
 local state = {strength=50, style='keep', rough=true, smooth=true, stairs=true, ramps=true, soil=true,
-               hide_overlays=true, engraved=true, faces=true, black_shadows=true}
+               overlays='hidden', engraved=true, faces=true, black_shadows=true}
 local view
 
 -- Running stone-tint from the console re-executes this whole file in the same
@@ -320,16 +289,27 @@ stone_tint_sources.by_hash = stone_tint_sources.by_hash or {}
 -- changes or our sentinel texture's texpos moves (DF reset its textures).
 local tint_cache = {}
 local tint_sentinel, tint_strength, tint_style
--- FLOOR EDGES (below). piece_sets: the texpos of every picture in a floor
--- page's set -> that set, {first_id=, texpos={[1 to 12]=}}, so a floor's edge
--- pieces are drawn from the set the floor came from. Rebuilt with floor_texpos.
-local piece_sets = {}
+-- FLOOR EDGES (below).
 local edge = {
-    info = {},      -- a tinted floor's texpos -> {set=, code=, sid=}: whose pieces it drops
+    info = {},      -- a tinted floor's texpos -> {code=, sid=}: the colour and picture its pieces take
     made = {},      -- a stack of pieces (stack_texpos's key) -> texpos, or false
     ours = {},      -- every stack's texpos -> true, to know one of ours in background_two
     count = 0,      -- open cells given tinted edges this frame, for `stone-tint status`
 }
+-- DF'S OWN PIECES AND OVERLAYS (below): what DF draws a floor's edge pieces
+-- and a ramp's overlay from, found in the graphics raws by token.
+-- stone[1 to 9], soil[1 to 9]: the texposes of STONE_FLOOR_1 to 9 and
+-- DIRT_FLOOR_1 to 9; overlay[case]: of OVERLAY_RAMP_WITH_WALL_* and
+-- OVERLAY_RAMP_OTHER, by the walls' case (case_of_walls); overlay_set: each
+-- overlay's texpos -> true; checks: {page, x, y, texpos} for each, to notice
+-- DF moving them; rehide: the overlays to be found again; dirs, files, found:
+-- what was read, for `stone-tint status`.
+local tokens = {stone = {}, soil = {}, overlay = {}, overlay_set = {}, checks = {},
+                dirs = 0, files = 0, found = 0}
+-- THE OVERLAY IN THE RAMP (below): made[sid][ov][code] = the texpos of a ramp's
+-- picture with its overlay laid in, or false (code 0: as drawn); laid: ramps
+-- given theirs this frame.
+local ramp = {made = {}, laid = 0}
 -- Every tinted texpos held here goes at once: a floor's texture is filed in
 -- edge.info only as paint_cell makes it, so the two are thrown away together.
 -- moved: DF renumbered its textures (or the map changed), so the stacks'
@@ -338,6 +318,7 @@ local edge = {
 local function reset_tints(moved)
     tint_cache = {}
     edge.info, edge.made = {}, {}
+    ramp.made = {}
     if moved then edge.ours = {} end
 end
 
@@ -382,28 +363,29 @@ local this_frame = {
 -- Detailed Weather (its colour.lua) recolours the ground for the weather by
 -- pointing DF's texture tables (gps.texture_indices1 to 11) at its own copies
 -- of every ground texture whenever its look is not the neutral one. DF then
--- draws a floor with the copy's texpos, which floor_texpos does not hold, so
--- the floor went untinted. Underground it is worse: Detailed Weather puts DF's
--- original back after we have drawn (its put_back_underground), so fort floors
--- showed plain vanilla. Read in its code 2026-11-15; not yet seen in play.
+-- draws a floor with the copy, which is tinted as drawn (TILES BY THE MAP), so
+-- the floor keeps the weather's colouring under the tint. Underground it puts
+-- DF's original back after we have drawn (its put_back_underground), so on a
+-- subterranean tile the copy's original is tinted instead: what it shows there
+-- itself. Read in its code 2026-11-15. Its restore underground only swaps back
+-- textures it knows as its own copies, and ours is not one, so what we draw
+-- stays.
 --
 -- It records every copy it points the tables at in the global
 -- detailed_weather_pointed_from (copy texpos -> DF's own texpos), and its
--- copy_of(original) answers which copy is showing now. A copy is filed as its
--- floor only while copy_of still returns it: DF hands a freed texture's number
--- to the next texture it makes (Detailed Weather's grass.lua notes this), and
--- Detailed Weather frees a look's copies once the look moves on, so a stale
--- entry could name a ramp or a tree. For the same reason every copy filed this
--- way is forgotten when the look changes (dw_check_look, once a frame).
---
--- Its restore underground only swaps back textures it knows as its own copies,
--- and ours is not one, so what we draw stays. Which picture we tint follows
--- what it means to show (paint_cell): outdoors its copy, so the floor keeps the
--- weather's colouring under the tint; on a subterranean tile DF's own, which is
--- what it puts back there itself.
+-- copy_of(original) answers which copy is showing now. A copy is taken for its
+-- original only while copy_of still returns it: DF hands a freed texture's
+-- number to the next texture it makes (Detailed Weather's grass.lua notes
+-- this), and Detailed Weather frees a look's copies once the look moves on, so
+-- a stale entry could name a ramp or a tree. For the same reason all that is
+-- filed by texpos is forgotten when the look changes (dw_check_look, once a
+-- frame). The edge pieces and ramp overlays drawn here (FLOOR EDGES, RAMP
+-- OVERLAYS) are taken from its copies while a look shows, as DF draws them.
 local dw_colour            -- its colour module; nil not looked up yet, false not running
 local dw_look              -- the look key it showed when last checked
-local dw_filed = {}        -- copy texpos -> DF's own texpos, for each copy filed in known_texpos
+-- This look's answers: filed[copy texpos] = DF's own texpos, or false (not one
+-- of its live copies); live[DF's own texpos] = what DF draws for it now.
+local dw_memo = {filed = {}, live = {}}
 
 -- BOTH DETAILED WEATHERS (2026-11-20). copy_of and shown_look are grungeisdead's copy's own; Poss's
 -- releases (1.4, 1.5) have neither, so with his every call failed (in pcall), no copy was ever filed,
@@ -439,24 +421,42 @@ local function dw_module()
     return dw_colour
 end
 
--- The floor art id (or ENGRAVED) for a texpos that is Detailed Weather's live
--- copy of one of our floor sprites, or nil.
-local function dw_floor(drawn)
-    local from = rawget(_G, 'detailed_weather_pointed_from')
-    local original = from and from[drawn]
-    if not original then return nil end
-    local id = floor_texpos[original]
-    if id == nil then return nil end
-    local mod = dw_module()
-    if not mod then return nil end
-    local ok, live = pcall(dw_live_copy, mod, original)
-    if not ok or live ~= drawn then return nil end
-    dw_filed[drawn] = original
-    return id
+-- DF's own texpos for a texpos that is Detailed Weather's live copy of it, or
+-- nil (filed for the look).
+local function dw_original(drawn)
+    local f = dw_memo.filed[drawn]
+    if f == nil then
+        f = false
+        local from = rawget(_G, 'detailed_weather_pointed_from')
+        local original = from and from[drawn]
+        local mod = original and dw_module()
+        if mod then
+            local ok, live = pcall(dw_live_copy, mod, original)
+            if ok and live == drawn then f = original end
+        end
+        dw_memo.filed[drawn] = f
+    end
+    return f or nil
 end
 
--- Once a frame: when Detailed Weather's look has changed, forget the copies
--- filed under the old one, so their freed numbers are filed afresh.
+-- What DF draws for its own `original` now: Detailed Weather's live copy of it
+-- while one of its looks shows, else the original itself (filed for the look).
+local function dw_shown(original)
+    local t = dw_memo.live[original]
+    if t == nil then
+        t = original
+        local mod = rawget(_G, 'detailed_weather_pointed_from') and dw_module()
+        if mod then
+            local ok, live = pcall(dw_live_copy, mod, original)
+            if ok and live then t = live end
+        end
+        dw_memo.live[original] = t
+    end
+    return t
+end
+
+-- Once a frame: when Detailed Weather's look has changed, everything filed by
+-- texpos is forgotten, so freed numbers are filed afresh.
 local function dw_check_look()
     local mod = dw_colour
     if not mod then return end   -- not looked up or not running: nothing filed
@@ -464,8 +464,8 @@ local function dw_check_look()
     key = ok and key or false
     if key == dw_look then return end
     dw_look = key
-    for texpos in pairs(dw_filed) do known_texpos[texpos] = nil end
-    dw_filed = {}
+    known_texpos = {}
+    dw_memo = {filed = {}, live = {}}
 end
 
 -- ==========================================
@@ -577,17 +577,17 @@ for name, kind in pairs({STONE='stone', SOIL='soil', MINERAL='vein',
 end
 local KIND_ORDER = {'stone', 'soil', 'vein', 'plants', 'other ground', 'feature', 'obsidian', 'other'}
 
--- tiletype -> its material class and shape, read off df.tiletype.attrs once
--- per tiletype. WHAT A TILE IS uses them too.
-local tt_material, tt_shape = {}, {}
+-- tiletype -> {material class, shape, special}, read off df.tiletype.attrs
+-- once per tiletype. WHAT A TILE IS uses them too.
+local tt_info = {}
 local function tile_attrs(tt)
-    local m = tt_material[tt]
-    if m == nil then
+    local info = tt_info[tt]
+    if not info then
         local attrs = df.tiletype.attrs[tt]
-        m = attrs.material
-        tt_material[tt], tt_shape[tt] = m, attrs.shape
+        info = {attrs.material, attrs.shape, attrs.special}
+        tt_info[tt] = info
     end
-    return m, tt_shape[tt]
+    return info[1], info[2], info[3]
 end
 
 -- What has been worked out on this map: colour codes by layer and by
@@ -961,10 +961,9 @@ end
 -- bytes in R, G, B, A order; vanilla's FLOORS 0:3 read back 1024 of 1024 equal
 -- to our stored copy of it. Each pixel is read whole, as one uint32 (surface).
 --
--- Engraved floors keep the stored art: DF draws them in fixed blue-greys no
--- tint can reach, and the "Engraving faces" switch picks between two pictures
--- of ours. A picture that cannot be read (no surface, not 32x32) falls back to
--- the stored art for its art id.
+-- Engraved floors are tinted as drawn too (ENGRAVED FLOORS BY THE MAP). A
+-- picture that cannot be read (no surface, not 32x32) falls back to the stored
+-- art for its art id.
 --
 -- Each pixel is keyed as build_stone_tint_art.py keys the stored art: the
 -- column of palettes.png row 0 nearest it in luminance, Rec.601 weights, ties
@@ -1144,6 +1143,74 @@ local function source_pixels(sid, ci, strength)
     return tinted_entries(pal, strength, data.list, data.idx), data.idx
 end
 
+-- A source's pixel list and 1024 indices: a picture read off DF, or for a
+-- negative id our stored art. nil if it has none. For pictures laid over
+-- another (FLOOR EDGES, THE OVERLAY IN THE RAMP).
+local function source_data(sid)
+    if sid < 0 then
+        local idx = decode(ART_CELL[-sid])
+        if not idx then return nil end
+        return art.PIXELS, idx
+    end
+    local data = stone_tint_sources.data[sid]
+    if not data then return nil end
+    return data.list, data.idx
+end
+
+-- ENGRAVED FLOORS BY THE MAP. The engravings filed again when their number
+-- has changed (once a frame).
+function engravings.list() return df.global.world.event.engravings end
+function engravings.refresh()
+    local ok, list = pcall(engravings.list)
+    if not ok or not list then return end
+    local n = #list
+    if n == engravings.count then return end
+    local by_level = {}
+    for i = 0, n - 1 do
+        local e = list[i]
+        if e and e.flags.floor then
+            local p = e.pos
+            local lz = by_level[p.z]
+            if not lz then lz = {} by_level[p.z] = lz end
+            local lx = lz[p.x]
+            if not lx then lx = {} lz[p.x] = lx end
+            lx[p.y] = true
+        end
+    end
+    engravings.count, engravings.by_level = n, by_level
+end
+-- Whether the floor at x, y, z is engraved.
+function engravings.at(x, y, z)
+    local lz = engravings.by_level[z]
+    local lx = lz and lz[x]
+    return lx and lx[y] or false
+end
+-- Whether texpos shows vanilla's engraving: true, false, or nil while its
+-- picture waits for a read. Its hash is read_source's, worked out once over
+-- our stored copy's pixels.
+function engravings.vanilla(texpos)
+    local h = engravings.vanilla_hash
+    if h == nil then
+        h = false
+        local idx = decode('engraved_floor')
+        if idx then
+            h = 0
+            for n = 0, CELL_PX * CELL_PX - 1 do
+                local e = art.PIXELS[idx[n + 1]]
+                if e[4] > 0 then
+                    h = (h * 31 + ((e[4] << 24) | (e[3] << 16) | (e[2] << 8) | e[1]) + n) % 9007199254740881
+                end
+            end
+        end
+        engravings.vanilla_hash = h
+    end
+    if not h then return false end
+    local sid = source_for(texpos)
+    if sid == nil then return nil end
+    local data = sid and stone_tint_sources.data[sid] or nil
+    return data ~= nil and data.hash == h
+end
+
 -- The texpos for one source in one colour (code: colour index + 1) at a
 -- strength, making the texture if this is its first request. Returns texpos,
 -- false (nothing to draw), or nil (not this frame: out of budget, or DF still
@@ -1190,34 +1257,229 @@ local function sentinel_texpos()
 end
 
 -- ==========================================
+-- DF'S OWN PIECES AND OVERLAYS
+-- ==========================================
+-- DF draws two things from its tables of token textures rather than from a
+-- picture layer, so they cannot be read off the screen:
+--   * a floor's edge pieces, over the cell beside it (FLOOR EDGES). DF's
+--     renderer (g_src renderer_2d.hpp, update_viewport_tile, read 2026-11-21)
+--     draws edging 9 (EDGING_STONE) on a side from gps.stone_floor_texpos[0]
+--     and edging 2 (EDGING_SOIL) from dirt_floor_texpos[0], at the side's
+--     piece (S 2, W 6, E 4, N 8; the corners SE 1, SW 3, NE 7, NW 9): the
+--     STONE_FLOOR_1 to 9 and DIRT_FLOOR_1 to 9 tokens, the same pieces
+--     whichever floor drops them;
+--   * a ramp's overlay (RAMP OVERLAYS).
+-- Which pictures those tokens hold is read from the graphics raws, so no page
+-- is named here and whichever graphics are installed are followed: every
+-- graphics folder a tile page came from (tile_pagest.graphics_dir; its parent
+-- when it holds no .txt file), in the order DF loaded them, every .txt file in
+-- it, every [TILE_GRAPHICS:page:x:y:token] for those tokens, the page's texpos
+-- at that cell (the page of that name from the same folder, else the last one
+-- loaded). A token several graphics give takes the last one loaded, as DF
+-- does, checked against DF's own tables: when that one's texture is in none of
+-- them and an earlier one's is, the earlier one. Read when DF's textures move
+-- (a map's load among them); each time the overlay widget updates, one token's
+-- page cell is looked at again, and a change has them all read again.
+local TEXTURE_TABLES = {}
+for i = 1, 11 do TEXTURE_TABLES[i] = 'texture_indices' .. i end
+local refresh_tokens
+do
+-- DF's walls byte for a ramp (screentexpos_ramp_flag bits 8 to 15) in its bit
+-- order, the order a case is written in, and each diagonal's two sides.
+local WALL_BITS = {'N', 'W', 'E', 'S', 'NW', 'NE', 'SW', 'SE'}
+local CASE_ORDER = {'N', 'S', 'E', 'W', 'NW', 'NE', 'SW', 'SE'}
+local SIDES_OF = {NW = {'N', 'W'}, NE = {'N', 'E'}, SW = {'S', 'W'}, SE = {'S', 'E'}}
+-- A ramp's case from its walls, the rule build_stone_tint_art.py names a
+-- ramp's cell by (read off vanilla's token names): the walls on its four
+-- sides, and each diagonal wall whose two sides are both open; none is OTHER.
+tokens.case_of_walls = {}
+for walls = 0, 255 do
+    local has, keep = {}, {}
+    for i, name in ipairs(WALL_BITS) do
+        if (walls >> (i - 1)) & 1 == 1 then has[name] = true end
+    end
+    for _, name in ipairs(CASE_ORDER) do
+        local sides = SIDES_OF[name]
+        if has[name] and not (sides and (has[sides[1]] or has[sides[2]])) then keep[#keep + 1] = name end
+    end
+    tokens.case_of_walls[walls] = #keep > 0 and table.concat(keep, ' ') or 'OTHER'
+end
+-- An overlay token's case (OVERLAY_RAMP_WITH_WALL_N_S_E_W: 'N S E W'), or nil.
+local function overlay_case(token)
+    if token == 'OVERLAY_RAMP_OTHER' then return 'OTHER' end
+    local suffix = token:match('^OVERLAY_RAMP_WITH_WALL_(.+)$')
+    if not suffix then return nil end
+    local has, keep = {}, {}
+    for part in suffix:gmatch('[^_]+') do has[part] = true end
+    for _, name in ipairs(CASE_ORDER) do if has[name] then keep[#keep + 1] = name end end
+    return #keep > 0 and table.concat(keep, ' ') or nil
+end
+-- The pieces' tokens: {'stone', n} and {'soil', n}.
+local PIECE_TOKENS = {}
+for n = 1, 9 do
+    PIECE_TOKENS['STONE_FLOOR_' .. n] = {'stone', n}
+    PIECE_TOKENS['DIRT_FLOOR_' .. n] = {'soil', n}
+end
+
+-- A loaded page's texpos at cell x, y, or nil.
+local function cell_texpos(page, x, y)
+    if not page or not page.loaded or x >= page.page_dim_x or y >= page.page_dim_y then return nil end
+    local i = y * page.page_dim_x + x
+    if i >= #page.texpos then return nil end
+    local t = page.texpos[i]
+    return t > 0 and t or nil
+end
+
+-- Every definition of a wanted token in the graphics raws, in load order:
+-- defs[token] = {{t=texpos, page=, x=, y=}, ...}; and the folders and files read.
+local function read_raws()
+    local pages = df.global.texture.page
+    local dirs, by_dir, by_name = {}, {}, {}
+    for pi = 0, #pages - 1 do
+        local page = pages[pi]
+        local ok, dir = pcall(function() return page.graphics_dir end)
+        if ok and type(dir) == 'string' and dir ~= '' then
+            if not by_dir[dir] then by_dir[dir] = {} dirs[#dirs + 1] = dir end
+            by_dir[dir][page.token] = page
+        end
+        by_name[page.token] = page
+    end
+    local defs, files = {}, 0
+    for _, dir in ipairs(dirs) do
+        local paths = {}
+        for _, folder in ipairs({dir, dir .. '/..'}) do
+            local ok, names = pcall(dfhack.filesystem.listdir, folder)
+            for _, name in ipairs(ok and names or {}) do
+                if name:lower():match('%.txt$') then paths[#paths + 1] = folder .. '/' .. name end
+            end
+            if #paths > 0 then break end
+        end
+        for _, path in ipairs(paths) do
+            local f = io.open(path, 'r')
+            local text = ''
+            if f then
+                text = f:read('a') or ''
+                f:close()
+                files = files + 1
+            end
+            if text:find('_FLOOR_', 1, true) or text:find('OVERLAY_RAMP_', 1, true) then
+                for pname, x, y, token in text:gmatch('%[TILE_GRAPHICS:([^:%]]+):(%d+):(%d+):([^:%]]+)%]') do
+                    if PIECE_TOKENS[token] or overlay_case(token) then
+                        x, y = tonumber(x), tonumber(y)
+                        local t = cell_texpos(by_dir[dir][pname] or by_name[pname], x, y)
+                        if t then
+                            local list = defs[token]
+                            if not list then list = {} defs[token] = list end
+                            list[#list + 1] = {t=t, page=pname, x=x, y=y}
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return defs, #dirs, files
+end
+
+-- Every value in DF's token tables: Detailed Weather's copies counted as their
+-- originals too, and the entries stone-tint points elsewhere as the values it
+-- keeps to put back.
+local function table_values()
+    local seen = {}
+    local from = rawget(_G, 'detailed_weather_pointed_from')
+    local gps = df.global.gps
+    for _, name in ipairs(TEXTURE_TABLES) do
+        local ok, arr = pcall(function() return gps[name] end)
+        if ok and arr then
+            for i = 0, #arr - 1 do
+                local v = arr[i]
+                seen[v] = true
+                local o = from and from[v]
+                if o then seen[o] = true end
+            end
+        end
+    end
+    for _, kept in ipairs({stone_tint_overlays, stone_tint_shades}) do
+        for _, s in ipairs(kept and kept.slots or {}) do seen[s[3]] = true end
+    end
+    return seen
+end
+
+-- force: read them all again; otherwise only if the next token's page cell (one
+-- a call, in turn) holds another texpos now. True when read.
+local check_at = 0
+refresh_tokens = function(force)
+    if not force then
+        local list = tokens.checks
+        if #list == 0 then return false end
+        check_at = check_at % #list + 1
+        local c = list[check_at]
+        if dfhack.screen.findGraphicsTile(c[1], c[2], c[3]) == c[4] then return false end
+    end
+    local ok, defs, dirs, files = pcall(read_raws)
+    if not ok then defs, dirs, files = {}, 0, 0 end
+    local values = next(defs) and table_values() or {}
+    local stone, soil, overlay, overlay_set, checks, found = {}, {}, {}, {}, {}, 0
+    for token, list in pairs(defs) do
+        local pick = list[#list]
+        if not values[pick.t] then
+            for k = #list - 1, 1, -1 do
+                if values[list[k].t] then pick = list[k] break end
+            end
+        end
+        local piece = PIECE_TOKENS[token]
+        if piece then
+            (piece[1] == 'stone' and stone or soil)[piece[2]] = pick.t
+        else
+            overlay[overlay_case(token)] = pick.t
+            overlay_set[pick.t] = true
+        end
+        found = found + 1
+        checks[#checks + 1] = {pick.page, pick.x, pick.y, dfhack.screen.findGraphicsTile(pick.page, pick.x, pick.y)}
+    end
+    tokens.stone, tokens.soil, tokens.overlay, tokens.overlay_set = stone, soil, overlay, overlay_set
+    tokens.checks, tokens.dirs, tokens.files, tokens.found = checks, dirs, files, found
+    -- the overlays hidden under the old textures are put back and hidden again under the
+    -- new ones (update_ramp_overlays); the pieces and overlays drawn from the old go
+    tokens.rehide = true
+    edge.made, ramp.made = {}, {}
+    return true
+end
+end
+
+-- ==========================================
 -- RAMP OVERLAYS
 -- ==========================================
--- DF draws a ramp overlay (the OVERLAY_RAMP_WITH_WALL_* tokens: vanilla's
--- RAMP_OVERLAY page, or Dark Depths' DARK_RAMP_OVERLAY) over every ramp's
--- background, picked by the same walls as the ramp. Seen in play: it covers
--- our tinted ramps. It is in no per-cell texpos layer, so it cannot be skipped
--- cell by cell. DF looks a token's texture up in its tables of token texposes,
--- gps.texture_indices1 to 11, as it draws: Making Fuel's hide sprite already
--- writes DF's ITEM_LIQUID entry there, and globs follow it live. So hiding the
--- overlay means pointing every overlay token's entry at one blank texture, and
--- showing it again means writing the old values back. The entries are found by
--- value: whichever hold a texpos off either overlay page. That is global, so
--- every ramp loses its overlay, not only the ones stone-tint draws. The shadows
--- are other tokens (SHADOWS_RAMP and SHADOWS_WALL, or Dark Depths' DARK_ ones)
--- and are left alone.
+-- DF draws a ramp overlay (its OVERLAY_RAMP_WITH_WALL_* and OVERLAY_RAMP_OTHER
+-- tokens: vanilla's angled one, Dark Depths' dark one, Detailed Landscapes'
+-- rounded one, whichever graphics fill them) over every ramp's picture, picked
+-- by the same walls as the ramp. It is in no per-cell texpos layer, so it
+-- cannot be changed cell by cell, and drawn over a tinted ramp in the graphics'
+-- own colours it hid the tint: Detailed Landscapes' is fully opaque (measured
+-- off ramps_overlay_lit_round.png 2026-11-13), and carries most of the rounded
+-- hills' shape (ramps went square without it, seen in play 2026-11-15).
+--
+-- (v1.2) So stone-tint draws the overlay into each ramp's own picture, tinted
+-- with the ramp (THE OVERLAY IN THE RAMP), and DF's is hidden: every token
+-- table entry holding an overlay's texture, or Detailed Weather's copy of one,
+-- points at one blank texture while ramps are tinted, and gets its old value
+-- back otherwise. DF looks a token's texture up in those tables
+-- (gps.texture_indices1 to 11) as it draws: Making Fuel's hide sprite writes
+-- its ITEM_LIQUID entry there and globs follow it live. The overlays' textures
+-- are DF's own, found by token (DF'S OWN PIECES AND OVERLAYS): until v1.1
+-- vanilla's RAMP_OVERLAY and Dark Depths' DARK_RAMP_OVERLAY pages were hidden
+-- by name, Detailed Landscapes' was left shown over the tint, and any other
+-- graphics' left alone. Hiding is global, so every ramp stone-tint sees gets
+-- its overlay drawn in: the ones it does not tint (grass, sand, constructed, a
+-- switch off) as drawn, as DF would show them. "Ramp overlays" in the window:
+-- Tinted (drawn in, the default), Hidden (drawn nowhere, as "Hide ramp
+-- overlays" did) or As drawn (left to DF, over the tint). The shadows are
+-- other tokens and are left alone.
 --
 -- The blank is a RESERVED texture: these entries hold raw texposes, not
 -- handles, and the dynamic range gets wiped and renumbered. The entries and
 -- their old values live in an environment global, so a console command
 -- re-running this file cannot lose what is needed to put them back.
 stone_tint_overlays = stone_tint_overlays or {hidden=false}
--- Detailed Landscapes' RAMP_OVERLAY_ROUND_DETAILED is deliberately not here:
--- it carries most of the rounded hills' shape, and hiding it left ramps square
--- (seen in play 2026-11-15). Vanilla's and Dark Depths' overlays are angular,
--- and are still hidden while ramps are tinted.
-local OVERLAY_PAGES = {RAMP_OVERLAY=true, DARK_RAMP_OVERLAY=true}
-local TEXTURE_TABLES = {}
-for i = 1, 11 do TEXTURE_TABLES[i] = 'texture_indices' .. i end
 
 local function blank_reserved_texpos()
     local ov = stone_tint_overlays
@@ -1233,31 +1495,16 @@ local function blank_reserved_texpos()
     return t and t > 0 and t or nil
 end
 
--- {table name, index, old value} for every token entry holding an overlay
--- texture. One pass over the tables, about 52,000 entries, so it runs only
--- when the overlays are hidden, never per frame.
+-- {table name, index, old value} for every token entry holding an overlay's
+-- texture: DF's own (tokens.overlay_set), or Detailed Weather's copy of one
+-- while one of its looks shows (detailed_weather_pointed_from, in both its
+-- versions; only Detailed Weather writes its copies into these tables, so a
+-- match is always one of its own). One pass over the tables, about 52,000
+-- entries, so it runs only when the overlays are hidden, never per frame.
 local function find_overlay_slots()
-    local wanted, any = {}, false
-    local pages = df.global.texture.page
-    for pi = 0, #pages - 1 do
-        local page = pages[pi]
-        if page.loaded and OVERLAY_PAGES[page.token] then
-            for j = 0, #page.texpos - 1 do
-                local t = page.texpos[j]
-                if t > 0 then wanted[t], any = true, true end
-            end
-            for j = 0, #page.texpos_gs - 1 do
-                local t = page.texpos_gs[j]
-                if t > 0 then wanted[t] = true end
-            end
-        end
-    end
+    local wanted = tokens.overlay_set
     local slots = {}
-    if not any then return slots end
-    -- (BOTH DETAILED WEATHERS, 2026-11-20) while Detailed Weather shows a look of its own, an overlay's
-    -- entries hold its copy, which no overlay page holds: found through its record of what each copy
-    -- it points the tables at was made from (detailed_weather_pointed_from, in both its versions).
-    -- Only Detailed Weather writes its copies into these tables, so a match is always one of its own.
+    if not next(wanted) then return slots end
     local from = rawget(_G, 'detailed_weather_pointed_from')
     local gps = df.global.gps
     for _, name in ipairs(TEXTURE_TABLES) do
@@ -1324,7 +1571,12 @@ local function refresh_overlays(blank)
 end
 function update_ramp_overlays()
     local ov = stone_tint_overlays
-    local want = art ~= nil and state.strength > 0 and state.ramps and state.hide_overlays
+    local want = art ~= nil and state.strength > 0 and state.ramps and state.overlays ~= 'shown'
+    -- (DF'S OWN PIECES AND OVERLAYS read again: hidden again under the textures found now)
+    if tokens.rehide then
+        tokens.rehide = false
+        if ov.hidden then show_ramp_overlays() end
+    end
     if ov.hidden then
         if not want then
             show_ramp_overlays()
@@ -1654,53 +1906,54 @@ end
 -- ==========================================
 -- WHAT A TILE IS
 -- ==========================================
--- The art id for a revealed natural stair or ramp of stone or soil (sand
--- excepted), or false for any other tile. flag is the tile's
+-- What a tile is to stone-tint, read off the map (TILES BY THE MAP): an art id
+-- for a revealed natural floor (or a boulder's tile), stair or ramp of stone,
+-- or of soil that is not sand; ENGRAVED for a natural stone floor with an
+-- engraving on it; RAMP_OTHER for any other ramp (it gets its overlay: RAMP
+-- OVERLAYS); false for anything else. The second value is true when no picture
+-- DF draws on a tile like this one is ever ours: a wall, a fortification, open
+-- space, a ramp's top, or grass (but for a grass ramp), which DF draws in
+-- pictures of its own. A tile
+-- under a shrub, a sapling or a construction is only false: the picture there
+-- may be a floor's that is ours elsewhere. flag is the tile's
 -- screentexpos_ramp_flag, which picks a ramp's cell. Map reads, so the render
--- loop calls it only for a texture it has not seen since the last reset and
--- for a stair or ramp tile it has not checked, never per cell per frame.
-local function natural_art(x, y, z, flag)
-    local tt = dfhack.maps.getTileType(x, y, z)
-    if not tt then return false end
-    local material, tshape = tile_attrs(tt)
-    local family
-    if STONE_MATERIALS[material] then
-        family = 'stone'
-    elseif material == MAT_SOIL then
-        family = 'soil'
-    else
-        return false
-    end
-    local id
-    local shape = STAIR_SHAPES[tshape]
-    if shape then
-        id = STAIR_ART[family][shape]
-    elseif tshape == df.tiletype_shape.RAMP and art then
-        local bits = flag and math.tointeger(flag)
-        local cell = bits and art.RAMP_CELL[(bits >> 8) & 0xFF]
-        id = cell and RAMP_ART[family][cell]
-    end
-    if not id then return false end
-    local des = dfhack.maps.getTileFlags(x, y, z)
-    if des and des.hidden then return false end
-    if family == 'soil' and is_sand(x, y, z) then return false end
-    return id
+-- loop calls it only for a tile whose picture changed, never per cell per
+-- frame.
+local tile_kind
+do
+local S = df.tiletype_shape
+local FLOOR_LIKE = {[S.FLOOR] = true, [S.BOULDER] = true}
+local NEVER_SHAPES = {[S.WALL] = true, [S.FORTIFICATION] = true, [S.EMPTY] = true, [S.RAMP_TOP] = true}
+local NEVER_MATERIALS = {}
+for _, name in ipairs({'GRASS_LIGHT', 'GRASS_DARK', 'GRASS_DRY', 'GRASS_DEAD'}) do
+    local m = df.tiletype_material[name]
+    if m then NEVER_MATERIALS[m] = true end
 end
-
--- Whether a tile DF drew its engraved floor picture on is one stone-tint draws:
--- a revealed natural stone floor. ENGRAVED or false. Map reads, so the render
--- loop calls it once per tile, kept against the texture like a learned stair
--- (paint_cell).
-local function natural_engraved(x, y, z)
+local RAMP, SMOOTH = S.RAMP, df.tiletype_special.SMOOTH
+tile_kind = function(x, y, z, flag)
     local tt = dfhack.maps.getTileType(x, y, z)
-    if not tt then return false end
-    local material, shape = tile_attrs(tt)
-    if not STONE_MATERIALS[material] or shape ~= df.tiletype_shape.FLOOR then
-        return false
-    end
+    if not tt then return false, false end
+    local material, tshape, special = tile_attrs(tt)
+    -- (a grass ramp still gets its overlay: RAMP_OTHER, below)
+    if NEVER_SHAPES[tshape] or (NEVER_MATERIALS[material] and tshape ~= RAMP) then return false, true end
+    local stair = STAIR_SHAPES[tshape]
+    if not (stair or tshape == RAMP or FLOOR_LIKE[tshape]) then return false, false end
     local des = dfhack.maps.getTileFlags(x, y, z)
-    if des and des.hidden then return false end
-    return ENGRAVED
+    if des and des.hidden then return false, false end
+    local family = STONE_MATERIALS[material] and 'stone' or (material == MAT_SOIL and 'soil') or nil
+    if family == 'soil' and is_sand(x, y, z) then family = nil end
+    if not family then return tshape == RAMP and RAMP_OTHER or false, false end
+    if stair then return STAIR_ART[family][stair], false end
+    if tshape == RAMP then
+        local bits = flag and math.tointeger(flag)
+        local cell = bits and art and art.RAMP_CELL[(bits >> 8) & 0xFF]
+        return (cell and RAMP_ART[family][cell]) or RAMP_OTHER, false
+    end
+    if family == 'stone' and special == SMOOTH then
+        return engravings.at(x, y, z) and ENGRAVED or KIND_ART.smooth, false
+    end
+    return family == 'stone' and KIND_ART.rough_stone or KIND_ART.rough_soil, false
+end
 end
 
 -- Whether a tile is subterranean (Detailed Weather's test for underground).
@@ -1717,21 +1970,22 @@ local function load_state()
     local saved = dfhack.persistent.getSiteData(GLOBAL_KEY, {})
     if tonumber(saved.strength) then state.strength = tonumber(saved.strength) end
     if TINT_STYLES[saved.style] then state.style = saved.style end
-    for _, k in ipairs({'rough', 'smooth', 'stairs', 'ramps', 'soil', 'hide_overlays', 'black_shadows',
-                        'engraved', 'faces'}) do
+    for _, k in ipairs({'rough', 'smooth', 'stairs', 'ramps', 'soil', 'black_shadows', 'engraved', 'faces'}) do
         if saved[k] ~= nil then state[k] = saved[k] end
     end
+    -- (v1.2) "Ramp overlays", in place of "Hide ramp overlays": a save from before
+    -- v1.2 has none, and takes the default (tinted).
+    if OVERLAY_MODES[saved.overlays] then state.overlays = saved.overlays end
 end
 
 local function save_state()
     if dfhack.isMapLoaded() then dfhack.persistent.saveSiteData(GLOBAL_KEY, state) end
 end
 
--- Forget every learned texture; keep only the floor sprites.
+-- Forget every texture filed (known_texpos), and Detailed Weather's answers.
 local function reset_known()
     known_texpos = {}
-    dw_filed = {}
-    for texpos, id in pairs(floor_texpos) do known_texpos[texpos] = id end
+    dw_memo = {filed = {}, live = {}}
 end
 
 local function reset_cache(z)
@@ -1803,62 +2057,6 @@ local function set_style(style)
     return true
 end
 
--- Only the pristine floor texposes need rediscovering; they move when the game
--- reloads graphics. Cheap: at most 39 findGraphicsTile calls. Learned
--- textures are dropped only when a floor texpos actually moved (or force), so
--- the periodic refresh does not throw away what the loop has learned.
-local function refresh_texpos_maps(force)
-    local fresh = {}
-    local fresh_sets = {}
-    local function add(list, first_id)
-        -- The list's first twelve pictures (pieces 1 to 9, then 5B to 5D) are
-        -- one set for FLOOR EDGES; VARIANTS' thirteenth, the smooth floor,
-        -- drops no edge pieces.
-        local set = {first_id=first_id, texpos={}}
-        for i, spec in ipairs(list) do
-            local texpos = dfhack.screen.findGraphicsTile(spec[1], spec[2], spec[3])
-            if texpos and texpos >= 0 then
-                fresh[texpos] = first_id + i - 1
-                if i <= 12 then
-                    set.texpos[i] = texpos
-                    fresh_sets[texpos] = set
-                end
-            end
-        end
-    end
-    add(VARIANTS, 1)
-    -- Also recognize vanilla rough-floor pages. This lets the same script run
-    -- standalone or alongside Detailed Landscapes.
-    add(VANILLA_VARIANTS, 1)
-    add(SOIL_VARIANTS, FIRST_SOIL_FLOOR)
-    -- Detailed Landscapes' own floor pages (ROUND_VARIANTS). A page that is
-    -- not loaded finds nothing, so this is harmless without it.
-    add(ROUND_VARIANTS, 1)
-    add(ROUND_SOIL_VARIANTS, FIRST_SOIL_FLOOR)
-    -- Engraved floors file as ENGRAVED, not an art id (ENGRAVED FLOORS).
-    engraved_found = 0
-    for _, spec in ipairs(ENGRAVED_PAGES) do
-        local texpos = dfhack.screen.findGraphicsTile(spec[1], spec[2], spec[3])
-        if texpos and texpos >= 0 then
-            fresh[texpos] = ENGRAVED
-            engraved_found = engraved_found + 1
-        end
-    end
-    local changed = force
-    for texpos, id in pairs(fresh) do
-        if floor_texpos[texpos] ~= id then changed = true end
-    end
-    for texpos in pairs(floor_texpos) do
-        if fresh[texpos] == nil then changed = true end
-    end
-    floor_texpos = fresh
-    piece_sets = fresh_sets
-    -- A floor picture that moved leaves every tinted floor's filed set stale.
-    if changed then
-        reset_known()
-        reset_tints()
-    end
-end
 
 -- ==========================================
 -- THE OVERLAY
@@ -1872,71 +2070,194 @@ StoneTintOverlay.ATTRS{
 
 function StoneTintOverlay:init()
     load_state()
-    refresh_texpos_maps(true)
     refresh_map_bounds()
     reset_cache(nil)
 end
 
 -- Per-frame values paint_cell reads, set at the top of each frame.
--- frame_engraved is the art id an engraved floor gets this frame.
-local frame_strength, frame_budget, frame_engraved = 0, 0, ENGRAVED_FACE
+-- frame_overlays: whether ramps get their overlays laid in this frame (THE
+-- OVERLAY IN THE RAMP).
+local frame_strength, frame_budget, frame_overlays = 0, 0, false
+
+-- ==========================================
+-- THE OVERLAY IN THE RAMP
+-- ==========================================
+-- While DF's overlays are hidden and "Ramp overlays" is Tinted, each ramp cell
+-- gets one texture: its picture with the overlay DF would draw over it laid
+-- in, the overlay of its walls' case (tokens.case_of_walls, from the tile's
+-- screentexpos_ramp_flag; none where DF shows its down arrow instead,
+-- VIEWPORT_RAMP_FLAG_SHOW_DOWN_ARROW). On a tinted ramp both are tinted with
+-- the ramp's colour, the overlay moved by the ramp's own shift (keep), as a
+-- floor's edge pieces are by their floor's, so the two match; any other
+-- ramp's are laid together as drawn. The overlay goes over the picture by its
+-- alpha. Kept by both pictures and the colour, made within the frame's
+-- texture budget.
+do
+local SHOW_DOWN_ARROW = 1 << 25
+
+-- A source's pixel entries packed for createTileset, as drawn.
+local function drawn_entries(list)
+    local out = {}
+    for i, e in ipairs(list) do
+        out[i] = e[4] == 0 and 0 or ((e[4] << 24) | (e[3] << 16) | (e[2] << 8) | e[1])
+    end
+    return out
+end
+
+-- Packed pixel `over` laid on `under` by its alpha (straight alpha, as DF's
+-- surfaces hold it).
+local function over_pixel(under, over)
+    local oa = over >> 24
+    if oa == 255 then return over end
+    if oa == 0 then return under end
+    local ua = under >> 24
+    if ua == 0 then return over end
+    local f = ua * (255 - oa) / 255          -- the share of the pixel under that shows
+    local a = oa + f
+    local function ch(s)
+        return math.floor((((over >> s) & 0xFF) * oa + ((under >> s) & 0xFF) * f) / a + 0.5)
+    end
+    return (math.floor(a + 0.5) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+end
+
+-- Ramp picture sid with overlay ov laid in: tinted with colour code `code` at
+-- strength, or as drawn when code is nil. Pixels, or nil.
+local function laid_pixels(sid, ov, code, strength)
+    local list, idx = source_data(sid)
+    local olist, oidx = source_data(ov)
+    if not list or not olist then return nil end
+    local under, over
+    if code then
+        local pal = palette_of(code - 1)
+        if not pal then return nil end
+        under = tinted_entries(pal, strength, list, idx)
+        over = tinted_entries(pal, strength, olist, oidx, list, idx)
+    else
+        under, over = drawn_entries(list), drawn_entries(olist)
+    end
+    local out = {}
+    for j = 1, CELL_PX * CELL_PX do out[j] = over_pixel(under[idx[j]], over[oidx[j]]) end
+    return out
+end
+
+-- The overlay's source for a ramp cell's flag: an id, false (none: no case, no
+-- token found, the down arrow, or a picture that cannot be read) or nil (not
+-- read yet). Under a Detailed Weather look, its copy of the overlay: what DF
+-- draws.
+function ramp.overlay(flag)
+    local bits = flag and math.tointeger(flag) or 0
+    if bits & SHOW_DOWN_ARROW ~= 0 then return false end
+    local t = tokens.overlay[tokens.case_of_walls[(bits >> 8) & 0xFF]]
+    if not t then return false end
+    return source_for(dw_shown(t))
+end
+
+-- The texpos of ramp picture sid with overlay ov laid in, tinted with `code` at
+-- the frame's strength (code nil: as drawn). texpos, false (cannot be made) or
+-- nil (not this frame).
+function ramp.texpos(sid, ov, code)
+    -- (looked up every frame for every ramp on screen: tables, no key made)
+    local by_sid = ramp.made[sid]
+    if not by_sid then by_sid = {} ramp.made[sid] = by_sid end
+    local by_ov = by_sid[ov]
+    if not by_ov then by_ov = {} by_sid[ov] = by_ov end
+    local t = by_ov[code or 0]
+    if t ~= nil then return t end
+    -- The handles live with the floors' textures, one store per style and
+    -- strength (one for ramps left as drawn), so a console re-run keeps them.
+    local key = sid .. ':' .. ov .. ':' .. (code or 0)
+    local stores = stone_tint_textures.ramps
+    if not stores then stores = {} stone_tint_textures.ramps = stores end
+    local skey = code and (state.style .. frame_strength) or 'drawn'
+    local store = stores[skey]
+    if not store then store = {} stores[skey] = store end
+    local handle = store[key]
+    if handle == nil then
+        if frame_budget <= 0 or not can_work() then return nil end
+        frame_budget = frame_budget - 1
+        local t0 = clock()
+        local px = laid_pixels(sid, ov, code, frame_strength)
+        handle = false
+        if px then
+            local ok, handles = pcall(dfhack.textures.createTileset, px, CELL_PX, CELL_PX,
+                CELL_PX, CELL_PX)
+            handle = ok and handles and handles[1] or false
+        end
+        this_frame.made, this_frame.made_s = this_frame.made + 1, this_frame.made_s + clock() - t0
+        store[key] = handle
+        if handle then stone_tint_stats.textures = stone_tint_stats.textures + 1 end
+    end
+    if not handle then
+        by_ov[code or 0] = false
+        return false
+    end
+    t = dfhack.textures.getTexposByHandle(handle)
+    -- 0 means DFHack is holding the texture until DF finishes loading.
+    if t and t > 0 then
+        by_ov[code or 0] = t
+        return t
+    end
+    return nil
+end
+
+-- A ramp stone-tint does not tint, while it draws the overlays in: its picture
+-- as drawn with its overlay laid in. Left as DF drew it (without its overlay)
+-- while either picture waits for a read or cannot be read.
+function ramp.plain(bg, flags, index, drawn)
+    if not frame_overlays then return nil end
+    local ov = ramp.overlay(flags[index])
+    if not ov then return nil end
+    local sid = source_for(drawn)
+    if not sid then return nil end
+    local t = ramp.texpos(sid, ov, nil)
+    if t then
+        bg[index] = t
+        ramp.laid = ramp.laid + 1
+    end
+    return nil
+end
+end
 
 -- One cell DF drew with a texture that may be ours (its known_texpos entry is
--- not false): works out which art it is, if any, and writes the tinted texture
--- over DF's. bg and flags are the arrays of the viewport the cell is in, z its
--- level, colours and checks that level's caches. Returns the kind of tile it
--- tinted, for the counts, or nil. One function for the level you are on and
--- the levels below, so both tint the same way. Every map read and material
--- lookup in here waits for a later frame once this frame's work is spent
--- (THE FRAME'S WORK CAP), and the cell keeps DF's own picture until then.
+-- not false): works out what its tile is (WHAT A TILE IS) and writes the tinted
+-- texture over DF's. bg and flags are the arrays of the viewport the cell is
+-- in, z its level, colours and checks that level's caches. Returns the kind of
+-- tile it tinted, for the counts, or nil. One function for the level you are
+-- on and the levels below, so both tint the same way. Every map read and
+-- material lookup in here waits for a later frame once this frame's work is
+-- spent (THE FRAME'S WORK CAP), and the cell keeps DF's own picture until then.
 local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
-    local id = known_texpos[drawn]
-    if id == nil then
-        -- First sight of this texture since the last reset. Detailed
-        -- Weather's live copy of a floor sprite is that floor (DETAILED
-        -- WEATHER); anything else takes one map read, which files it for
-        -- every cell after this.
+    -- What this tile is, read off the map once and kept against the picture DF
+    -- drew there: under a Detailed Weather look, its copy's original, so the
+    -- next look's copy of the same picture reads nothing again (every floor on
+    -- screen did at each change of weather). A texture's first sight since the
+    -- last reset also files it: never looked at again when no picture on a
+    -- tile like this one is ours.
+    local original = dw_original(drawn)
+    local key = original or drawn
+    local ccol = checks[wx]
+    if not ccol then ccol = {} checks[wx] = ccol end
+    local check = ccol[wy]
+    if not check or check.texpos ~= key then
         if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
         local t0 = clock()
-        id = dw_floor(drawn)
-        if id == nil then
-            id = natural_art(wx, wy, z, flags[index]) and LEARNED or false
-        end
-        known_texpos[drawn] = id
+        local id, never = tile_kind(wx, wy, z, flags[index])
+        check = {texpos=key, id=id, never=never}
+        ccol[wy] = check
         this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
     end
-    if id == LEARNED then
-        -- A texture DF drew on a natural stair or ramp. Which shape this tile
-        -- is, and for a ramp which walls it meets, is read once and kept
-        -- against the texture, so a changed tile is read again.
-        local ccol = checks[wx]
-        if not ccol then ccol = {} checks[wx] = ccol end
-        local check = ccol[wy]
-        if not check or check.texpos ~= drawn then
-            if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
-            local t0 = clock()
-            check = {texpos=drawn, id=natural_art(wx, wy, z, flags[index])}
-            ccol[wy] = check
-            this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
-        end
-        id = check.id
-    elseif id == ENGRAVED then
-        -- DF's engraved floor picture (ENGRAVED FLOORS). Whether this tile is
-        -- natural stone is read once and kept against the texture, as above;
-        -- which picture it gets is the "Engraving faces" switch.
-        local ccol = checks[wx]
-        if not ccol then ccol = {} checks[wx] = ccol end
-        local check = ccol[wy]
-        if not check or check.texpos ~= drawn then
-            if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
-            local t0 = clock()
-            check = {texpos=drawn, id=natural_engraved(wx, wy, z)}
-            ccol[wy] = check
-            this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
-        end
-        id = check.id and frame_engraved
+    if known_texpos[drawn] == nil then known_texpos[drawn] = not check.never end
+    local id = check.id
+    if not id then return nil end
+    if id == RAMP_OTHER then return ramp.plain(bg, flags, index, drawn) end
+    -- An engraved floor counts and switches as one; its picture is picked below.
+    local engraved = id == ENGRAVED
+    if engraved then id = ENGRAVED_FACE end
+    local kind = ART_KIND[id]
+    if not group_enabled[ART_GROUP[id]] then
+        if kind == K_RAMP then return ramp.plain(bg, flags, index, drawn) end
+        return nil
     end
-    if not id or not group_enabled[ART_GROUP[id]] then return nil end
     local col = colours[wx]
     if not col then col = {} colours[wx] = col end
     local code = col[wy]
@@ -1947,52 +2268,65 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
         col[wy] = code
         this_frame.colours, this_frame.colour_s = this_frame.colours + 1, this_frame.colour_s + clock() - t0
     end
-    if code == 0 then return nil end
-    -- Which picture to tint (THE ART AS DRAWN): the one DF drew, or the stored
-    -- art for an engraved floor.
-    local sid
-    if ART_KIND[id] == K_ENGRAVED then
-        sid = -id
-    else
-        local src = drawn
-        -- Detailed Weather's copy of a floor (DETAILED WEATHER): its weather
-        -- colouring outdoors, DF's own picture on a subterranean tile, read
-        -- once per tile and kept against the texture like a learned stair.
-        local original = dw_filed[drawn]
-        if original then
-            local ccol = checks[wx]
-            if not ccol then ccol = {} checks[wx] = ccol end
-            local check = ccol[wy]
-            if not check or check.texpos ~= drawn then
-                if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
-                local t0 = clock()
-                check = {texpos=drawn, under=is_subterranean(wx, wy, z)}
-                ccol[wy] = check
-                this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
-            end
-            if check.under then src = original end
-        end
-        sid = source_for(src)
-        if sid == nil then return nil end   -- not read yet: DF's own picture this frame
-        if not sid then sid = -id end       -- cannot be read: the stored art
+    if code == 0 then
+        if kind == K_RAMP then return ramp.plain(bg, flags, index, drawn) end
+        return nil
     end
-    local per = tint_cache[sid]
-    if not per then per = {} tint_cache[sid] = per end
-    local texpos = per[code]
-    if texpos == nil then
-        texpos, frame_budget = tint_texpos(sid, code, frame_strength, frame_budget)
-        -- nil: not this frame, so not cached; asked again next frame
-        if texpos ~= nil then per[code] = texpos end
-        -- FLOOR EDGES: a floor's tinted texture is filed with what its edge
-        -- pieces need, its set, colour and picture, as it is made.
-        if texpos and ART_KIND[id] == K_FLOOR then
-            local set = piece_sets[dw_filed[drawn] or drawn]
-            if set then edge.info[texpos] = {set=set, code=code, sid=sid} end
+    -- Which picture to tint (THE ART AS DRAWN): the one DF drew; under one of
+    -- Detailed Weather's copies on a subterranean tile, the copy's original
+    -- (DETAILED WEATHER), read once per tile and kept with what the tile is.
+    local src = drawn
+    if original then
+        if check.under == nil then
+            if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
+            local t0 = clock()
+            check.under = is_subterranean(wx, wy, z)
+            this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
+        end
+        if check.under then src = original end
+    end
+    local sid = source_for(src)
+    if sid == nil then return nil end   -- not read yet: DF's own picture this frame
+    if engraved then
+        -- Engraving faces off, and DF's picture vanilla's engraving: our copy
+        -- without the face. Any other engraving as drawn.
+        if not state.faces then
+            local vanilla = engravings.vanilla(original or drawn)
+            if vanilla == nil then return nil end
+            if vanilla then sid = -ENGRAVED_PLAIN end
+        end
+        if not sid then sid = state.faces and -ENGRAVED_FACE or -ENGRAVED_PLAIN end
+    elseif not sid then
+        sid = -id                          -- cannot be read: the stored art
+    end
+    local texpos
+    if kind == K_RAMP and frame_overlays then
+        -- THE OVERLAY IN THE RAMP: its overlay laid in and tinted with it. Until
+        -- both are ready, the ramp alone, tinted.
+        local ov = ramp.overlay(flags[index])
+        if ov then
+            texpos = ramp.texpos(sid, ov, code)
+            if texpos then ramp.laid = ramp.laid + 1 end
+        end
+    end
+    if not texpos then
+        local per = tint_cache[sid]
+        if not per then per = {} tint_cache[sid] = per end
+        texpos = per[code]
+        if texpos == nil then
+            texpos, frame_budget = tint_texpos(sid, code, frame_strength, frame_budget)
+            -- nil: not this frame, so not cached; asked again next frame
+            if texpos ~= nil then per[code] = texpos end
+            -- FLOOR EDGES: a floor's tinted texture is filed with its colour and
+            -- picture, which the pieces it drops take, as it is made.
+            if texpos and (kind == K_FLOOR or kind == K_ENGRAVED) then
+                edge.info[texpos] = {code=code, sid=sid}
+            end
         end
     end
     if not texpos then return nil end
     bg[index] = texpos
-    return ART_KIND[id]
+    return kind
 end
 
 -- ==========================================
@@ -2000,11 +2334,10 @@ end
 -- ==========================================
 -- A floor's art is a 3x3 set: the floor itself in the middle (piece 5, or 5B
 -- to 5D) and eight small pieces round it that hang over its edges into the
--- next cells (vanilla's FLOORS 0:3 to 2:5, Landscapes' FLOORS_ROUND_DETAILED
--- at the same cells, soil on the dirt rows below). Where a floor meets open
--- ground (a channel, a ramp's top, a cliff) DF draws those pieces on the open
--- cell in the art's own colours, so every tinted floor kept a grey lip round
--- a channel (seen in play 2026-11-15).
+-- next cells (STONE_FLOOR_1 to 9, DIRT_FLOOR_1 to 9 for soil). Where a floor
+-- meets open ground (a channel, a ramp's top, a cliff) DF draws those pieces
+-- on the open cell in the art's own colours, so every tinted floor kept a grey
+-- lip round a channel (seen in play 2026-11-15).
 --
 -- They are not in any picture layer: stone-tint-cell-probe found no picture in
 -- Landscapes' stone colours in any texpos layer on the rim's cells. DF draws
@@ -2028,11 +2361,15 @@ end
 -- more). So every cell DF draws on a level is looked at, whatever its own
 -- background, whenever that level has floors of ours.
 --
--- So on every cell with edging, each side whose floor stone-tint tinted this
--- frame gets that floor's piece, tinted as the floor is (keep moves it by the
--- floor's own shift), and each corner between two sides carrying the same
--- edging ID, one of them ours, gets the diagonal floor's corner piece in the
--- diagonal's tint (a side's, when the diagonal is not one of ours). Corners
+-- So on every cell with edging, each side with stone or soil edging (9, 2)
+-- whose floor stone-tint tinted this frame gets the piece DF draws there (DF'S
+-- OWN PIECES AND OVERLAYS: since v1.2 by token, the same pieces whichever
+-- graphics fill them; until v1.1 from the floor's own page, by name), tinted as
+-- the floor is (keep moves it by the floor's own shift), and each corner
+-- between two sides carrying the same stone or soil edging, one of them ours,
+-- gets that corner's piece in the diagonal floor's tint (a side's, when the
+-- diagonal is not one of ours). Edging of any other kind (grass, sand,
+-- pebbles) is left as DF draws it. Corners
 -- were measured only where both sides held 9; where the two sides hold
 -- different IDs (a grass edge beside a stone one) what DF draws is not known,
 -- so no corner is added there. The pieces are stacked into
@@ -2072,29 +2409,23 @@ local CORNERS = {
 local taken = {}
 local p_sid, p_code, p_fsid, parts = {}, {}, {}, {}
 
--- A source's pixel list and 1024 indices: a picture read off DF, or for a
--- negative id our stored art (THE ART AS DRAWN). nil if it has none.
-local function source_data(sid)
-    if sid < 0 then
-        local idx = decode(ART_CELL[-sid])
-        if not idx then return nil end
-        return art.PIXELS, idx
-    end
-    local data = stone_tint_sources.data[sid]
-    if not data then return nil end
-    return data.list, data.idx
-end
+-- The pieces by edging ID: DF's own (DF'S OWN PIECES AND OVERLAYS), and the
+-- art id of our stored copy of piece 1 (for a picture that cannot be read).
+local EDGINGS = {[9] = {'stone', 1}, [2] = {'soil', FIRST_SOIL_FLOOR}}
 
--- Puts one piece of a floor's set (f, an edge.info entry) on top of the stack
--- of n. Returns the new count, or nil while the piece's picture waits for a
--- read: then the cell keeps DF's own edges this frame.
-local function add_piece(n, f, piece)
-    local texpos = f.set.texpos[piece]
+-- Puts piece `piece` of edging `id`'s set on top of the stack of n, tinted as
+-- floor f (an edge.info entry). Returns the new count, or nil while the piece
+-- waits for a read or DF's piece was not found: then the cell keeps DF's own
+-- edges this frame.
+local function add_piece(n, f, id, piece)
+    local e = EDGINGS[id]
+    local texpos = e and tokens[e[1]][piece]
     if not texpos then return nil end
-    local sid = source_for(texpos)
+    -- (under a Detailed Weather look, its copy of the piece: what DF draws)
+    local sid = source_for(dw_shown(texpos))
     if sid == nil then return nil end
     -- Cannot be read: our stored copy of that piece.
-    if not sid then sid = -(f.set.first_id + piece - 1) end
+    if not sid then sid = -(e[2] + piece - 1) end
     n = n + 1
     p_sid[n], p_code[n], p_fsid[n] = sid, f.code, f.sid
     return n
@@ -2170,12 +2501,12 @@ end
 -- One open cell's stack: the texpos for its edging (flag) at screen cell sx,
 -- sy, or nil when no side's floor is ours or a piece waits for a read.
 local function cell_stack(flag, sx, sy, bg, dim_x, dim_y, info)
-    -- Each side with edging: is the floor that drops it one of ours?
+    -- Each side with stone or soil edging: is the floor that drops it one of ours?
     local any = false
     for s = 1, 4 do
         local side = SIDES[s]
         local f = false
-        if (flag >> side.shift) & 0xFF ~= 0 then
+        if EDGINGS[(flag >> side.shift) & 0xFF] then
             local nx, ny = sx + side.dx, sy + side.dy
             if nx >= 0 and nx < dim_x and ny >= 0 and ny < dim_y then
                 f = info[bg[nx * dim_y + ny]] or false
@@ -2191,18 +2522,20 @@ local function cell_stack(flag, sx, sy, bg, dim_x, dim_y, info)
         local corner = CORNERS[c]
         local a, b = corner.a, corner.b
         local id = (flag >> SIDES[a].shift) & 0xFF
-        if np and (taken[a] or taken[b]) and id ~= 0
+        if np and (taken[a] or taken[b]) and EDGINGS[id]
                 and (flag >> SIDES[b].shift) & 0xFF == id then
             local f
             local nx, ny = sx + corner.dx, sy + corner.dy
             if nx >= 0 and nx < dim_x and ny >= 0 and ny < dim_y then
                 f = info[bg[nx * dim_y + ny]]
             end
-            np = add_piece(np, f or taken[a] or taken[b], corner.piece)
+            np = add_piece(np, f or taken[a] or taken[b], id, corner.piece)
         end
     end
     for s = 1, 4 do
-        if np and taken[s] then np = add_piece(np, taken[s], SIDES[s].piece) end
+        if np and taken[s] then
+            np = add_piece(np, taken[s], (flag >> SIDES[s].shift) & 0xFF, SIDES[s].piece)
+        end
     end
     if not np or np == 0 then return nil end
     return stack_texpos(np) or nil
@@ -2258,11 +2591,12 @@ end
 --     out of scope we simply decline to write, and DF's own sprite stands.
 --
 -- So the work went into making each cell nearly free instead. Per cell in the
--- common case (not one of our floors, stairs or ramps) this is one array read
--- and one hash lookup, with no allocation and no C call; an empty cell is one
--- read and a note for the level below. Map reads happen only to file a texture
--- the loop has not seen since the last reset and to check a stair or ramp tile
--- once; material lookups once per tile per z-level, kept while the level is
+-- common case (a texture never ours) this is one array read and one hash
+-- lookup, with no allocation and no C call; a cell whose texture may be ours
+-- takes two lookups more (what its tile is, kept against the texture); an
+-- empty cell is one read and a note for the level below. Map reads happen only
+-- for a tile whose picture changed (WHAT A TILE IS); material lookups once per
+-- tile per z-level, kept while the level is
 -- near the view; texture making at most NEW_TEXTURES_PER_FRAME times a frame;
 -- and all of it within WORK_MS a frame (THE FRAME'S WORK CAP). The levels
 -- below cost nothing more than the cells the level above left empty (THE
@@ -2376,7 +2710,8 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
         -- the fog below is worked out again (FOG BELOW).
         stone_tint_sources.by_texpos = {}
         fog_copies = {}
-        refresh_texpos_maps(true)
+        reset_known()
+        refresh_tokens(true)
         relearn = (clock() - t0) * 1000
     end
     -- THE ART AS DRAWN: this frame's reads, and a new round of checks now and then.
@@ -2408,6 +2743,8 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
 
     -- Detailed Weather's look moved on: its old copies' numbers may be reused.
     dw_check_look()
+    -- ENGRAVED FLOORS BY THE MAP: filed again if their number changed.
+    engravings.refresh()
 
     -- Taken after the z, sentinel and strength checks above, any of which can
     -- replace them.
@@ -2422,7 +2759,10 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     counts[K_FLOOR], counts[K_STAIR], counts[K_RAMP], counts[K_ENGRAVED] = 0, 0, 0, 0
     edge.count = 0
     frame_strength, frame_budget = strength, NEW_TEXTURES_PER_FRAME
-    frame_engraved = state.faces and ENGRAVED_FACE or ENGRAVED_PLAIN
+    -- THE OVERLAY IN THE RAMP: only while DF's overlays are hidden, any found
+    local ov = stone_tint_overlays
+    frame_overlays = state.overlays == 'tinted' and ov.hidden and ov.slots ~= nil and #ov.slots > 0
+    ramp.laid = 0
     local colours, checks = level_caches(z)
     local open, n_open = see_through, 0
     local scanned = dim_x * dim_y         -- cells looked at this frame, for the report
@@ -2455,8 +2795,8 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     end
 
     -- FLOOR EDGES on this level, every cell, and only when it has floors of
-    -- ours to drop them.
-    local floors_so_far = counts[K_FLOOR]
+    -- ours to drop them (engraved ones count).
+    local floors_so_far = counts[K_FLOOR] + counts[K_ENGRAVED]
     if floors_so_far > 0 then paint_edges(vp, bg, nil, dim_x * dim_y, dim_x, dim_y) end
 
     -- The levels below, one at a time, through the cells left empty above
@@ -2496,9 +2836,9 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
         end
         -- This level's floor edges, as on the level above: every cell of it
         -- that shows (open, the list it was walked through).
-        if counts[K_FLOOR] > floors_so_far then
+        if counts[K_FLOOR] + counts[K_ENGRAVED] > floors_so_far then
             paint_edges(lvp, lbg, open, n_open, dim_x, dim_y)
-            floors_so_far = counts[K_FLOOR]
+            floors_so_far = counts[K_FLOOR] + counts[K_ENGRAVED]
         end
         open, next_open, n_open = next_open, open, n_next
     end
@@ -2509,6 +2849,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     stone_tint_stats.ramps = counts[K_RAMP]
     stone_tint_stats.below = below
     stone_tint_stats.edges = edge.count
+    stone_tint_stats.laid = ramp.laid
     local took = (clock() - started) * 1000
     stone_tint_stats.frame_ms = timed_average(stone_tint_stats.frame_ms, took)
     stone_tint_stats.worst_ms = math.max(stone_tint_stats.worst_ms or 0, took)
@@ -2523,9 +2864,10 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
 end
 
 function StoneTintOverlay:overlay_onupdate()
-    -- Graphics can be reloaded without changing texture handles. Refresh only the
-    -- texpos values that identify the game's original floor sprites.
-    refresh_texpos_maps(false)
+    -- Graphics can be reloaded without changing texture handles: one of DF's
+    -- own pieces or overlays looked at again, all read again if it moved (DF'S
+    -- OWN PIECES AND OVERLAYS).
+    refresh_tokens(false)
 end
 
 -- Module state outlives a world: DFHack caches script environments, and the
@@ -2536,14 +2878,19 @@ end
 dfhack.onStateChange[GLOBAL_KEY] = function(sc)
     if sc == SC_MAP_LOADED then
         -- Detailed Weather is looked up again for each map (DETAILED WEATHER).
-        dw_colour, dw_look, dw_filed = nil, nil, {}
+        dw_colour, dw_look, dw_memo = nil, nil, {filed = {}, live = {}}
+        -- (so the first frame drawn relearns, DF'S OWN PIECES AND OVERLAYS
+        -- included, even should the textures come back at the same numbers)
+        tint_sentinel = nil
         palettes = {}
         entry_cache = {}
         reset_tints(true)
         reset_material_caches()
         refresh_map_bounds()
         load_state()
-        refresh_texpos_maps(true)
+        -- (DF'S OWN PIECES AND OVERLAYS are read in the first frame drawn: the
+        -- map's load moves DF's textures, which reads them, THE OVERLAY)
+        engravings.count, engravings.by_level = -1, {}
         reset_cache(nil)
     elseif sc == SC_MAP_UNLOADED or sc == SC_WORLD_UNLOADED then
         -- Put DF's ramp overlays and shadows back; the next map redoes them.
@@ -2556,6 +2903,7 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
         entry_cache = {}
         reset_tints(true)
         reset_material_caches()
+        engravings.count, engravings.by_level = -1, {}
         if sc == SC_WORLD_UNLOADED then
             -- Colour indices belong to a world. The textures are not deleted
             -- (see make_texture); they are only forgotten.
@@ -2605,6 +2953,8 @@ function TintWindow:init()
     end
     local style_options = {}
     for i, st in ipairs(TINT_STYLES) do style_options[i] = {label=st[2], value=st[1]} end
+    local overlay_options = {}
+    for i, m in ipairs(OVERLAY_MODES) do overlay_options[i] = {label=m[2], value=m[1]} end
     self:addviews{
         widgets.Label{text='Tint strength:'},
         widgets.CycleHotkeyLabel{
@@ -2635,9 +2985,16 @@ function TintWindow:init()
         -- Soil rides on the switches above: a soil floor, stair or ramp needs
         -- this and the switch for its shape.
         toggle('Include soil:', 'CUSTOM_O', 'soil'),
-        -- Global: every ramp's overlay goes, see RAMP OVERLAYS. Only while
-        -- ramps are tinted.
-        toggle('Hide ramp overlays:', 'CUSTOM_H', 'hide_overlays'),
+        -- DF's ramp overlays (RAMP OVERLAYS): drawn into every ramp, tinted with
+        -- the tinted ones; hidden everywhere; or left to DF, over the tint. Only
+        -- while ramps are tinted.
+        widgets.CycleHotkeyLabel{
+            label='Ramp overlays:', key='CUSTOM_H', options=overlay_options,
+            initial_option=state.overlays,
+            on_change=function(value)
+                state.overlays = value save_state() update_ramp_overlays() force_repaint()
+            end,
+        },
         -- Black shadows and depth fog, whatever graphics are loaded (SHADOWS
         -- AND FOG). Independent of the tint.
         toggle('Black shadows and fog:', 'CUSTOM_B', 'black_shadows'),
@@ -2660,6 +3017,7 @@ function set_preset(strength)
 end
 
 function clear_material_cache()
+    refresh_tokens(true)
     reset_cache(nil)
     reset_material_caches()
     stone_tint_sources.by_texpos = {}
@@ -2674,24 +3032,23 @@ function get_state()
 end
 
 -- For `stone-tint status`: whether the art loaded, the counts the overlay
--- keeps in stone_tint_stats, the ramp overlay entries hidden, how many of the
--- engraved floor pages were found, and whether the art has the engraved cells
--- (an art-vanilla.lua older than this file does not, and then engraved floors
--- keep DF's picture).
+-- keeps in stone_tint_stats, the ramp overlay entries hidden, DF's own pieces
+-- and overlays found (tokens), and whether the art has the engraved cells (an
+-- art-vanilla.lua older than this file does not, and then vanilla's engraving
+-- is not known, nor drawn without its face).
 function get_report()
     local ov = stone_tint_overlays
     local engraved_art = art ~= nil and art.CELLS.engraved_floor ~= nil
         and art.CELLS.engraved_floor_plain ~= nil
     local sh = stone_tint_shades
     return art ~= nil, stone_tint_stats, ov.hidden and #(ov.slots or {}) or nil,
-        engraved_found, #ENGRAVED_PAGES, engraved_art, sh.applied and #(sh.slots or {}) or nil
+        tokens, engraved_art, sh.applied and #(sh.slots or {}) or nil
 end
 
 
 -- Initialize module state independently of widget construction. DFHack can preserve
 -- widget class objects across development rescans without calling init() again.
 load_state()
-refresh_texpos_maps(true)
 refresh_map_bounds()
 
 OVERLAY_WIDGETS = {map=StoneTintOverlay}
@@ -2714,19 +3071,21 @@ function stone_tint_command(...)
             overlay.isOverlayEnabled('stone-tint.map') and 'enabled' or 'disabled'))
         print(('stone-tint: strength is %d%%, tint style %s'):format(get_state().strength,
             get_state().style))
-        local art_ok, stats, hidden, engraved_found, engraved_pages, engraved_art, shaded =
-            get_report()
+        local art_ok, stats, hidden, tk, engraved_art, shaded = get_report()
         if not art_ok then
             print('stone-tint: art data stone-tint/art-vanilla.lua did not load; nothing is tinted')
         end
         print(('stone-tint: tinted in the last drawn frame: %d floor, %d engraved, %d stair, %d ramp '
-            .. 'tiles, %d of them on levels below'):format(stats.floors, stats.engraved or 0,
-            stats.stairs, stats.ramps, stats.below or 0))
+            .. 'tiles, %d of them on levels below; ramps given their overlay: %d'):format(stats.floors,
+            stats.engraved or 0, stats.stairs, stats.ramps, stats.below or 0, stats.laid or 0))
         print(('stone-tint: floor edges over open ground tinted in the last drawn frame: %d cells; '
             .. 'found still in place from an earlier frame, so far: %d'):format(stats.edges or 0,
             stats.edges_kept or 0))
-        print(('stone-tint: engraved floor pages found: %d of %d; engraved art %s'):format(
-            engraved_found, engraved_pages,
+        -- DF'S OWN PIECES AND OVERLAYS: what was read, and what was found.
+        local function count(t) local n = 0 for _ in pairs(t) do n = n + 1 end return n end
+        print(('stone-tint: DF\'s own pieces and overlays, read from %d graphics folders (%d files): '
+            .. 'stone floor pieces %d of 9, soil floor pieces %d of 9, ramp overlays %d; engraved art %s')
+            :format(tk.dirs, tk.files, count(tk.stone), count(tk.soil), count(tk.overlay),
             engraved_art and 'loaded' or 'missing from stone-tint/art-vanilla.lua'))
         print(('stone-tint: textures made this session: %d, from %d pictures read off DF'):format(
             stats.textures, stats.sources or 0))
@@ -2760,9 +3119,10 @@ function stone_tint_command(...)
             fast.note and ('differed at ' .. fast.note) or 'none differed'))
         stats.worst_ms, stats.upkeep_worst_ms = 0, 0
         if hidden then
-            print(('stone-tint: ramp overlays hidden (%d DF table entries)'):format(hidden))
+            print(('stone-tint: DF\'s ramp overlays hidden (%d DF table entries), %s'):format(hidden,
+                get_state().overlays == 'tinted' and 'drawn into the ramps' or 'drawn nowhere'))
         else
-            print('stone-tint: ramp overlays shown')
+            print('stone-tint: ramp overlays as the graphics draw them')
         end
         if shaded then
             print(('stone-tint: shadows and fog black (%d DF table entries)'):format(shaded))
