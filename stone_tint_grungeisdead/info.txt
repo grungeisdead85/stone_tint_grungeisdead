@@ -4,7 +4,7 @@
 [EARLIEST_COMPATIBLE_NUMERIC_VERSION:1]
 [EARLIEST_COMPATIBLE_DISPLAYED_VERSION:1.0.0]
 [AUTHOR:Snowstar837]
-[NAME:Stone Tint (grungeisdead)]
+[NAME:Stone Tint (grungeisdead copy)]
 [DESCRIPTION:Modified version of Stone Tint (Snowstar837) maintained by grungeisdead]
 [STEAM_TITLE:Stone Tint (grungeisdead copy)]
 [STEAM_DESCRIPTION:Modified version of Stone Tint (Snowstar837) maintained by grungeisdead]
