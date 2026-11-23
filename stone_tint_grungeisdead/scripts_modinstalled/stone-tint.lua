@@ -1886,13 +1886,15 @@ end
 
 -- One shadow or fog texture redrawn, packed for createTile, or nil when it
 -- cannot be read.
-local function shaded_pixels(texpos, kind, flatten)
+local function shaded_pixels(texpos, kind, flatten, flat_alpha)
     local px, pitch = surface(texpos)
     if not px then return nil end
-    local out, sum = {}, 0
+    local out, sum, min_a, max_a = {}, 0, 255, 0
     for n = 0, CELL_PX * CELL_PX - 1 do
         local p = px[(n // CELL_PX) * pitch + n % CELL_PX]
         local a = p >> 24
+        if a < min_a then min_a = a end
+        if a > max_a then max_a = a end
         -- Black keeps the pixel's alpha: a << 24.
         if kind == 'fog' or (p & 0xFF) * 0.299 + ((p >> 8) & 0xFF) * 0.587
                 + ((p >> 16) & 0xFF) * 0.114 < SHADE_MAX_LUMA then
@@ -1901,9 +1903,11 @@ local function shaded_pixels(texpos, kind, flatten)
         out[n + 1] = p
         sum = sum + a
     end
-    if kind == 'fog' and flatten then
-        -- A ramp's fog cell filled flat at its own mean alpha, in black.
+    if kind == 'fog' and flatten and sum > 0 then
+        -- Non-uniform ramp fog cells take the flat depth-1 fog's alpha instead of their
+        -- own half-empty mean, so depth-1 ramps match the depth-1 floor beside them.
         local mean = (sum + 512) // 1024
+        if min_a < max_a and flat_alpha and mean < flat_alpha then mean = flat_alpha end
         for i = 1, CELL_PX * CELL_PX do out[i] = mean << 24 end
     end
     return out
@@ -1915,7 +1919,22 @@ end
 local function apply_shades()
     local sh = stone_tint_shades
     local kinds, rounded = shade_textures()
-    local made, slots = {}, {}
+    local flat_alpha = nil
+    if rounded then
+        local ok_f, t0 = pcall(function() return df.global.gps.texture_indices1[0] end)
+        if ok_f and t0 and t0 > 0 then
+            local px0, pitch0 = surface(t0)
+            if px0 then
+                local s0 = 0
+                for n = 0, CELL_PX * CELL_PX - 1 do
+                    s0 = s0 + (px0[(n // CELL_PX) * pitch0 + n % CELL_PX] >> 24)
+                end
+                local m0 = (s0 + 512) // 1024
+                if m0 > 0 then flat_alpha = m0 end
+            end
+        end
+    end
+    local made, slots, black_set = {}, {}, {}
     local gps = df.global.gps
     for _, name in ipairs(TEXTURE_TABLES) do
         local ok, arr = pcall(function() return gps[name] end)
@@ -1927,10 +1946,13 @@ local function apply_shades()
                     local copy = made[v]
                     if copy == nil then
                         copy = false
-                        local px = shaded_pixels(v, kind, rounded)
+                        local px = shaded_pixels(v, kind, rounded, flat_alpha)
                         local t, handle
                         if px then t, handle = copy_texpos(px, true) end
-                        if t then copy = {texpos=t, handle=handle} end
+                        if t then
+                            copy = {texpos=t, handle=handle}
+                            if kind == 'fog' then black_set[t] = true end
+                        end
                         made[v] = copy
                     end
                     if copy then
@@ -1945,7 +1967,7 @@ local function apply_shades()
     -- Marked applied even when nothing was found, so the tables are not
     -- searched again every frame; status reports the count. flat: whether
     -- ramp fog is filled flat, for the fog DF builds below (FOG BELOW).
-    sh.slots, sh.applied, sh.flat = slots, true, rounded
+    sh.slots, sh.applied, sh.flat, sh.flat_alpha, sh.black_set = slots, true, rounded, flat_alpha, black_set
 end
 
 local function remove_shades()
@@ -1958,7 +1980,7 @@ local function remove_shades()
             if gps[s[1]][s[2]] == s[5] then gps[s[1]][s[2]] = s[3] end
         end)
     end
-    sh.slots, sh.applied = nil, false
+    sh.slots, sh.applied, sh.black_set = nil, false, nil
 end
 
 -- Keep the shadows the way the settings ask, as update_ramp_overlays does the
@@ -1969,10 +1991,12 @@ end
 -- refresh_overlays does, with no search.
 local function refresh_shades()
     local gps = df.global.gps
+    local black_set = {}
     for _, s in ipairs(stone_tint_shades.slots) do
         local copy = s[4]
         local t = dfhack.textures.getTexposByHandle(copy.handle)
         if t and t > 0 then copy.texpos = t end
+        black_set[copy.texpos] = true
         pcall(function()
             local arr = gps[s[1]]
             local v = arr[s[2]]
@@ -1981,6 +2005,7 @@ local function refresh_shades()
             s[5] = copy.texpos
         end)
     end
+    stone_tint_shades.black_set = black_set
 end
 function update_shades()
     local sh = stone_tint_shades
@@ -2033,11 +2058,13 @@ local fog_reads = 0
 
 -- A fog texture's black copy, packed for createTile, or nil when it is not
 -- fog (a visible pixel not vanilla's fog blue).
-local function black_fog_pixels(px, pitch, flatten)
-    local out, sum, any = {}, 0, false
+local function black_fog_pixels(px, pitch, flatten, flat_alpha)
+    local out, sum, any, min_a, max_a = {}, 0, false, 255, 0
     for n = 0, CELL_PX * CELL_PX - 1 do
         local p = px[(n // CELL_PX) * pitch + n % CELL_PX]
         local a = p >> 24
+        if a < min_a then min_a = a end
+        if a > max_a then max_a = a end
         if a > 0 then
             if math.abs((p & 0xFF) - FOG_RGB[1]) > FOG_TOLERANCE
                     or math.abs(((p >> 8) & 0xFF) - FOG_RGB[2]) > FOG_TOLERANCE
@@ -2052,6 +2079,7 @@ local function black_fog_pixels(px, pitch, flatten)
     if not any then return nil end
     if flatten then
         local mean = (sum + 512) // 1024
+        if min_a < max_a and flat_alpha and mean < flat_alpha then mean = flat_alpha end
         for i = 1, CELL_PX * CELL_PX do out[i] = mean << 24 end
     end
     return out
@@ -2076,37 +2104,59 @@ local function fog_copy(t)
         return c.copy
     end
     local copy = false
-    local black = black_fog_pixels(px, pitch, stone_tint_shades.flat)
-    if black then copy = copy_texpos(black, false) or false end
+    local black = black_fog_pixels(px, pitch, stone_tint_shades.flat, stone_tint_shades.flat_alpha)
+    if black then
+        copy = copy_texpos(black, false) or false
+        if copy and stone_tint_shades.black_set then stone_tint_shades.black_set[copy] = true end
+    end
     fog_copies[t] = {copy=copy, addr=addr, sig=sig, round=source_round}
     return copy
 end
 
--- Each frame: the fog layer of the levels below, made black. When cells/n are
--- passed, scans only the open cells where lower_viewport[0] actually shows.
-local function paint_fog(cells, n)
+local fog_zeros = {buf = nil, size = 0}
+local function fog_zeros_for(n)
+    if fog_zeros.size < n then
+        if fog_zeros.buf then df.delete(fog_zeros.buf) end
+        local buf = df.new('int32_t', n)
+        for k = 0, n - 1 do buf[k] = 0 end
+        fog_zeros.buf, fog_zeros.size = buf, n
+    end
+    return fog_zeros.buf
+end
+
+local function fog_interface_base(lvp)
+    local ok, slot = pcall(function() local _, at = df.sizeof(lvp:_field('screentexpos_interface')) return at end)
+    if ok and slot then return df.reinterpret_cast('uint64_t', slot).value end
+end
+
+-- Each frame: the fog layer of the levels below, made black. Scans all non-zero
+-- cells via diffscan (skipping empty runs in C++) so fog under tree branches
+-- and leaves (whose depth-0 background is non-zero) is blackened too.
+local function paint_fog()
     if not state.black_shadows or not stone_tint_shades.applied then return end
     local lvp = df.global.gps.lower_viewport[0]
     if not lvp or not lvp.flag.active then return end
     fog_reads = FOG_READS_PER_FRAME
     local layer = lvp.screentexpos_interface
-    if cells then
-        for k = 1, n do
-            local i = cells[k]
-            local t = layer[i]
-            if t ~= 0 then
-                local copy = fog_copy(t)
-                if copy then layer[i] = copy end
-            end
+    local total = lvp.dim_x * lvp.dim_y
+    if total <= 0 then return end
+    local black_set = stone_tint_shades.black_set or {}
+    local diffscan = dfhack.internal.diffscan
+    local base = diffscan and fog_interface_base(lvp)
+    local zeros = base and fog_zeros_for(total)
+    local i = 0
+    while i < total do
+        local t = layer[i]
+        if t == 0 and zeros then
+            i = diffscan(zeros, base, i + 1, total, 4)
+            if not i then break end
+            t = layer[i]
         end
-    else
-        for i = 0, lvp.dim_x * lvp.dim_y - 1 do
-            local t = layer[i]
-            if t ~= 0 then
-                local copy = fog_copy(t)
-                if copy then layer[i] = copy end
-            end
+        if t ~= 0 and not black_set[t] then
+            local copy = fog_copy(t)
+            if copy then layer[i] = copy end
         end
+        i = i + 1
     end
 end
 
@@ -3283,7 +3333,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
         end
     end
 
-    if n_open > 0 then paint_fog(open, n_open) end
+    paint_fog()
 
     -- FLOOR EDGES on this level (runs whenever rough stone or soil is enabled,
     -- so off-screen rough floors still tint lips along the screen border).
