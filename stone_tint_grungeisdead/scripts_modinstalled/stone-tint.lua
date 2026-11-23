@@ -44,7 +44,7 @@ local CELL_PX = 32
 -- texture per kind of tile it covers; a z-level full of new materials would
 -- otherwise make them all in one frame and stall it. A tile waiting its turn
 -- keeps DF's own picture for a frame or two.
-local NEW_TEXTURES_PER_FRAME = 12
+local NEW_TEXTURES_PER_FRAME = 32
 
 -- ==========================================
 -- THE ART
@@ -256,7 +256,7 @@ local color_cache = {}          -- [z] = {[world_x] = {[world_y] = colour code}}
 local tile_checks = {}
 local map_max_x, map_max_y      -- tile bounds, refreshed on map load
 local state = {strength=50, style='keep', rough=true, smooth=true, stairs=true, ramps=true, soil=true,
-               overlays='hidden', engraved=true, faces=true, black_shadows=true}
+               overlays='hidden', engraved=true, faces=true, black_shadows=true, edges='smart'}
 local view
 
 -- Running stone-tint from the console re-executes this whole file in the same
@@ -295,6 +295,12 @@ local edge = {
     made = {},      -- a stack of pieces (stack_texpos's key) -> texpos, or false
     ours = {},      -- every stack's texpos -> true, to know one of ours in background_two
     count = 0,      -- open cells given tinted edges this frame, for `stone-tint status`
+    modes = {{'smart', 'Smart'}, {'simple', 'Simple'}, {'off', 'Off'},
+             smart=true, simple=true, off=true},
+    sources = {},   -- [z][wx][wy] = 9 (stone), 2 (soil), or false: map fallback for off-screen/overhang floors
+    fallback = {},  -- code -> {code=, under=false} reused across frames
+    piece_px = {},  -- [sid][code] = flat {j, abgr, ...} pre-tinted opaque pixels for one edge piece
+    floor_px = {},  -- [sid][code] = 1024 pre-tinted floor pixels for smart edge baking
 }
 -- DF'S OWN PIECES AND OVERLAYS (below): what DF draws a floor's edge pieces
 -- and a ramp's overlay from, found in the graphics raws by token.
@@ -304,7 +310,7 @@ local edge = {
 -- overlay's texpos -> true; checks: {page, x, y, texpos} for each, to notice
 -- DF moving them; rehide: the overlays to be found again; dirs, files, found:
 -- what was read, for `stone-tint status`.
-local tokens = {stone = {}, soil = {}, overlay = {}, overlay_set = {}, checks = {},
+local tokens = {stone = {}, soil = {}, pebbles = {}, overlay = {}, overlay_set = {}, checks = {},
                 dirs = 0, files = 0, found = 0}
 -- THE OVERLAY IN THE RAMP (below): made[sid][ov][code] = the texpos of a ramp's
 -- picture with its overlay laid in, or false (code 0: as drawn); laid: ramps
@@ -317,7 +323,7 @@ local ramp = {made = {}, laid = 0}
 -- the old one is still known as ours (paint_edges).
 local function reset_tints(moved)
     tint_cache = {}
-    edge.info, edge.made = {}, {}
+    edge.info, edge.made, edge.fallback, edge.piece_px, edge.floor_px = {}, {}, {}, {}, {}
     ramp.made = {}
     if moved then edge.ours = {} end
 end
@@ -512,6 +518,36 @@ local function palette_of(ci)
     return pal
 end
 
+-- SOIL ON A ROCK LAYER / ROCK ON A SOIL LAYER: at the soil-rock boundary, a
+-- tile's geolayer_index can point at the neighbouring layer type. DF resolves
+-- a soil tile on rock to the deepest SOIL_ANY layer above it, and a stone tile
+-- on soil to the shallowest non-soil layer below it.
+local function adjust_layer_mat(x, y, z, want_soil)
+    local rx, ry = dfhack.maps.getTileBiomeRgn(x, y, z)
+    if not ry then return nil end
+    local region = dfhack.maps.getRegionBiome(rx, ry)
+    local biome = region and df.world_geo_biome.find(region.geo_index)
+    local block = dfhack.maps.getTileBlock(x, y, z)
+    if not biome or not block then return nil end
+    local index = block.designation[x % 16][y % 16].geolayer_index
+    if want_soil then
+        for i = math.min(index, #biome.layers) - 1, 0, -1 do
+            local inorganic = df.inorganic_raw.find(biome.layers[i].mat_index)
+            if inorganic and inorganic.flags.SOIL_ANY then
+                return dfhack.matinfo.decode(0, biome.layers[i].mat_index)
+            end
+        end
+    else
+        for i = math.max(0, index + 1), #biome.layers - 1 do
+            local inorganic = df.inorganic_raw.find(biome.layers[i].mat_index)
+            if inorganic and not inorganic.flags.SOIL_ANY then
+                return dfhack.matinfo.decode(0, biome.layers[i].mat_index)
+            end
+        end
+    end
+    return nil
+end
+
 -- The colour code for a tile: its colour index + 1, or 0 for none.
 local function colour_code(x, y, z)
     local ok, matinfo = pcall(tile_material.GetTileMat, x, y, z)
@@ -519,7 +555,22 @@ local function colour_code(x, y, z)
         local ok2, fallback = pcall(tile_material.GetLayerMat, x, y, z)
         matinfo = ok2 and fallback or nil
     end
-    local ci = matinfo and matinfo.material and material_colour(matinfo.material)
+    local material
+    pcall(function()
+        material = matinfo.material
+        local tt = dfhack.maps.getTileType(x, y, z)
+        local tmat = tt and df.tiletype.attrs[tt].material
+        if tmat == df.tiletype_material.SOIL
+                and matinfo.inorganic and not matinfo.inorganic.flags.SOIL_ANY then
+            local soil = adjust_layer_mat(x, y, z, true)
+            if soil then material = soil.material end
+        elseif tmat == df.tiletype_material.STONE
+                and matinfo.inorganic and matinfo.inorganic.flags.SOIL_ANY then
+            local rock = adjust_layer_mat(x, y, z, false)
+            if rock then material = rock.material end
+        end
+    end)
+    local ci = material and material_colour(material)
     return ci and ci + 1 or 0
 end
 
@@ -552,8 +603,8 @@ end
 -- session, and `stone-tint status` reports it with the tile.
 local MAT_SOIL = df.tiletype_material.SOIL
 local MAT_MINERAL = df.tiletype_material.MINERAL
-local FAST_CHECKS = 256
-local FAST_CHECK_EVERY = 64
+local FAST_CHECKS = 32
+local FAST_CHECK_EVERY = 256
 
 -- The tiletype materials whose colour is their layer's, and the kind each
 -- tiletype material is counted as in `stone-tint status`. Tiles with a plant
@@ -590,11 +641,87 @@ local function tile_attrs(tt)
     return info[1], info[2], info[3]
 end
 
+-- How the checks on the fast lookups stand, plus per-frame block cache
+-- (memmove of tiletype and designation) and geolayer sand cache.
+local fast = {on=true, calls=0, checked=0, note=nil, full_n=0, full_s=0, kinds={},
+              layer_sand={}, blocks={}, frame=0, blocks_frame=-1}
+
+function fast.init_bits()
+    fast.des_init = true
+    local raw = df.new('uint32_t')
+    local _, at = df.sizeof(raw)
+    local d = df.reinterpret_cast(df.tile_designation, at)
+    local function bool_mask(name, fallback)
+        raw.value = 0
+        local ok = pcall(function() d[name] = true end)
+        return (ok and raw.value ~= 0) and raw.value or fallback
+    end
+    local function int_bits(name, fb_shift, fb_mask)
+        raw.value = 0
+        local ok = pcall(function() d[name] = 1 end)
+        if not ok or raw.value == 0 then return fb_shift, fb_mask end
+        local v, shift = raw.value, 0
+        while (v & 1) == 0 do v = v >> 1 shift = shift + 1 end
+        raw.value = 0
+        pcall(function() d[name] = 15 end)
+        local mask = raw.value >> shift
+        return shift, (mask ~= 0) and mask or fb_mask
+    end
+    fast.m_hidden = bool_mask('hidden', 1 << 9)
+    fast.m_sub = bool_mask('subterranean', 1 << 15)
+    fast.s_geo, fast.m_geo = int_bits('geolayer_index', nil, nil)
+    fast.s_bio, fast.m_bio = int_bits('biome', nil, nil)
+    df.delete(raw)
+    fast.tt_buf = df.new('uint16_t', 256)
+    fast.des_buf = df.new('uint32_t', 256)
+end
+
+function fast.block(x, y, z)
+    if fast.blocks_frame ~= fast.frame then
+        if next(fast.blocks) then fast.blocks = {} end
+        fast.blocks_frame = fast.frame
+    end
+    local blocks = fast.blocks
+    local bx, by = x >> 4, y >> 4
+    local key = ((z * 4096) + bx) * 4096 + by
+    local b = blocks[key]
+    if b ~= nil then return b or nil end
+    local block = dfhack.maps.getTileBlock(x, y, z)
+    if not block then blocks[key] = false return nil end
+    if not fast.des_init then fast.init_bits() end
+    local _, tat = df.sizeof(block:_field('tiletype'))
+    dfhack.internal.memmove(fast.tt_buf, tat, 512)
+    local _, dat = df.sizeof(block:_field('designation'))
+    dfhack.internal.memmove(fast.des_buf, dat, 1024)
+    local tt, des = {}, {}
+    local tbuf, dbuf = fast.tt_buf, fast.des_buf
+    for i = 0, 255 do tt[i], des[i] = tbuf[i], dbuf[i] end
+    b = {tt = tt, des = des, rgn = {}}
+    blocks[key] = b
+    return b
+end
+
+function fast.rgn(b, x, y, z, d)
+    if fast.m_bio then
+        local slot = (d >> fast.s_bio) & fast.m_bio
+        local r = b.rgn[slot]
+        if r ~= nil then
+            if r then return r[1], r[2] end
+            return nil
+        end
+        local rx, ry = dfhack.maps.getTileBiomeRgn(x, y, z)
+        b.rgn[slot] = ry and {rx, ry} or false
+        return rx, ry
+    end
+    return dfhack.maps.getTileBiomeRgn(x, y, z)
+end
+
 -- What has been worked out on this map: colour codes by layer and by
 -- inorganic index, and each block's mineral events. Emptied on a map load.
 local layer_codes, inorganic_codes, mineral_blocks = {}, {}, {}
 local function reset_material_caches()
     layer_codes, inorganic_codes, mineral_blocks = {}, {}, {}
+    fast.layer_sand, fast.blocks = {}, {}
 end
 
 -- A material's colour code, made as colour_code makes it.
@@ -604,18 +731,43 @@ local function material_code(matinfo)
 end
 
 -- Stone and soil: the colour code of the tile's layer, or nil.
-local function layer_code(x, y, z)
-    local rx, ry = dfhack.maps.getTileBiomeRgn(x, y, z)
+-- want: 0 = raw layer, 1 = soil (walk up off rock), 2 = stone (walk down off soil).
+-- Also caches SOIL_SAND per geolayer in fast.layer_sand so is_sand() costs zero
+-- tile-material calls per tile.
+local function layer_code(x, y, z, want)
+    local b = fast.block(x, y, z)
+    if not b then return nil end
+    local d = b.des[(x & 15) * 16 + (y & 15)]
+    local rx, ry = fast.rgn(b, x, y, z, d)
     if not ry then return nil end
-    local des = dfhack.maps.getTileFlags(x, y, z)
-    if not des then return nil end
+    local geo
+    if fast.m_geo then
+        geo = (d >> fast.s_geo) & fast.m_geo
+    else
+        local des = dfhack.maps.getTileFlags(x, y, z)
+        if not des then return nil end
+        geo = des.geolayer_index
+    end
     -- Region coordinates offset, so a -1 at a world edge cannot share a key.
-    local key = ((rx + 1024) * 4096 + ry + 1024) * 16 + des.geolayer_index
+    local base_key = ((rx + 1024) * 4096 + ry + 1024) * 16 + geo
+    local key = base_key * 3 + (want or 0)
     local code = layer_codes[key]
     if code == nil then
         local ok, matinfo = pcall(tile_material.GetLayerMat, x, y, z)
-        code = material_code(ok and matinfo or nil)
+        matinfo = ok and matinfo or nil
+        if want == 1 and matinfo and matinfo.inorganic and not matinfo.inorganic.flags.SOIL_ANY then
+            local soil = adjust_layer_mat(x, y, z, true)
+            if soil then matinfo = soil end
+        elseif want == 2 and matinfo and matinfo.inorganic and matinfo.inorganic.flags.SOIL_ANY then
+            local rock = adjust_layer_mat(x, y, z, false)
+            if rock then matinfo = rock end
+        end
+        code = material_code(matinfo)
         layer_codes[key] = code
+        if want == 1 then
+            fast.layer_sand[base_key] = matinfo and matinfo.inorganic
+                and matinfo.inorganic.flags.SOIL_SAND or false
+        end
     end
     return code
 end
@@ -667,22 +819,17 @@ end
 -- The fast lookup for a tile of tiletype material m, or nil to use
 -- colour_code.
 local function fast_colour_code(x, y, z, m)
-    if m == MAT_MINERAL then return vein_code(x, y, z) or layer_code(x, y, z) end
-    return layer_code(x, y, z)
+    if m == MAT_MINERAL then return vein_code(x, y, z) or layer_code(x, y, z, 0) end
+    return layer_code(x, y, z, m == MAT_SOIL and 1 or m == df.tiletype_material.STONE and 2 or 0)
 end
-
--- How the checks on the fast lookups stand, for `stone-tint status`: on
--- (false once one differed), calls and checks so far, the first difference,
--- colour_code's own lookups timed while checking (full_n, full_s), and every
--- lookup by kind (KIND_OF) as {count, seconds}.
-local fast = {on=true, calls=0, checked=0, note=nil, full_n=0, full_s=0, kinds={}}
 
 -- A tile's colour code: the fast lookup, checked against colour_code now and
 -- then, or colour_code itself.
 local function lookup_colour(x, y, z)
     local t0 = clock()
     local m
-    local tt = dfhack.maps.getTileType(x, y, z)
+    local b = fast.block(x, y, z)
+    local tt = b and b.tt[(x & 15) * 16 + (y & 15)]
     if tt then
         local ok_m, mm = pcall(tile_attrs, tt)
         if ok_m then m = mm end
@@ -717,8 +864,22 @@ local function lookup_colour(x, y, z)
 end
 
 -- Sand is soil to the map, but DF draws it with art of its own (sand floors,
--- stairs and ramps), so it keeps that look.
+-- stairs and ramps), so it keeps that look. Cached per geolayer so panning
+-- across sand surfaces costs zero tile-material calls per tile.
 local function is_sand(x, y, z)
+    local b = fast.block(x, y, z)
+    if b and fast.m_geo then
+        local d = b.des[(x & 15) * 16 + (y & 15)]
+        local rx, ry = fast.rgn(b, x, y, z, d)
+        if ry then
+            local base_key = ((rx + 1024) * 4096 + ry + 1024) * 16 + ((d >> fast.s_geo) & fast.m_geo)
+            local cached = fast.layer_sand[base_key]
+            if cached ~= nil then return cached end
+            layer_code(x, y, z, 1)
+            cached = fast.layer_sand[base_key]
+            if cached ~= nil then return cached end
+        end
+    end
     local sand = false
     pcall(function()
         local matinfo = tile_material.GetTileMat(x, y, z)
@@ -843,20 +1004,25 @@ end
 -- without it keep cannot be worked out and smooth is used.
 -- mean_list, mean_idx: another picture to take keep's mean from, so a floor's
 -- edge piece moves by its floor's own shift and the two match (FLOOR EDGES).
-tinted_entries = function(pal, strength, list, idx, mean_list, mean_idx)
+tinted_entries = function(pal, strength, list, idx, mean_list, mean_idx, mean_rgb)
     list = list or art.PIXELS
     local s = strength / 100.0
     local style = state.style
     local out = {}
-    if style == 'keep' and idx then
-        local ml, mi = mean_list or list, mean_idx or idx
-        local sr, sg, sb, n = 0, 0, 0, 0
-        for i = 1, #mi do
-            local e = ml[mi[i]]
-            if e[4] > 0 then sr, sg, sb, n = sr + e[1], sg + e[2], sb + e[3], n + 1 end
+    if style == 'keep' and (idx or mean_rgb) then
+        local mr, mg, mb
+        if mean_rgb then
+            mr, mg, mb = mean_rgb[1], mean_rgb[2], mean_rgb[3]
+        else
+            local ml, mi = mean_list or list, mean_idx or idx
+            local sr, sg, sb, n = 0, 0, 0, 0
+            for i = 1, #mi do
+                local e = ml[mi[i]]
+                if e[4] > 0 then sr, sg, sb, n = sr + e[1], sg + e[2], sb + e[3], n + 1 end
+            end
+            if n == 0 then n = 1 end
+            mr, mg, mb = sr / n, sg / n, sb / n
         end
-        if n == 0 then n = 1 end
-        local mr, mg, mb = sr / n, sg / n, sb / n
         local tr, tg, tb = palette_target(pal, mr * 0.299 + mg * 0.587 + mb * 0.114)
         -- One shift for the whole picture.
         local dr, dg, db = s * (tr - mr), s * (tg - mg), s * (tb - mb)
@@ -1042,24 +1208,28 @@ end
 -- A picture's pixels in the stored art's form: its distinct pixels as
 -- {r, g, b, a, key} (entry 1 the clear pixel) and its 1024 indices into them.
 local function read_source(px, pitch)
-    local list, idx, seen = {{0, 0, 0, 0, 0}}, {}, {}
-    local hash = 0
+    local list, idx, seen, opaque = {{0, 0, 0, 0, 0}}, {}, {}, {}
+    local hash, sr, sg, sb, cnt, on = 0, 0, 0, 0, 0, 0
     for n = 0, CELL_PX * CELL_PX - 1 do
         local packed = px[(n // CELL_PX) * pitch + n % CELL_PX]
         local i = 1
         if packed >> 24 > 0 then
+            local r, g, b = packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF
+            sr, sg, sb, cnt = sr + r, sg + g, sb + b, cnt + 1
             i = seen[packed]
             if not i then
-                local r, g, b = packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF
                 list[#list + 1] = {r, g, b, packed >> 24, key_of(r, g, b)}
                 i = #list
                 seen[packed] = i
             end
+            on = on + 2
+            opaque[on - 1], opaque[on] = n + 1, i
             hash = (hash * 31 + packed + n) % 9007199254740881
         end
         idx[n + 1] = i
     end
-    return {list=list, idx=idx, hash=hash}
+    if cnt == 0 then cnt = 1 end
+    return {list=list, idx=idx, hash=hash, mean={sr / cnt, sg / cnt, sb / cnt}, opaque=opaque}
 end
 
 -- The source id for the picture a texpos shows: a positive id, false when it
@@ -1079,9 +1249,6 @@ local function source_for(texpos)
         end
         frame_checks = frame_checks - 1
         stone_tint_stats.checks = (stone_tint_stats.checks or 0) + 1
-    elseif frame_reads <= 0 or not can_work() then
-        waiting[texpos] = frame_id
-        return nil
     end
     local t0 = clock()
     local px, pitch, addr = surface(texpos)
@@ -1096,11 +1263,6 @@ local function source_for(texpos)
         s.round, s.addr = source_round, addr
         return s.id
     end
-    if frame_reads <= 0 or not can_work() then
-        waiting[texpos] = frame_id
-        return s and s.id or nil
-    end
-    frame_reads = frame_reads - 1
     stone_tint_stats.reads = (stone_tint_stats.reads or 0) + 1
     -- A picture already read under another texpos (DF reused a number, or
     -- moved its textures on a world load) keeps its id, and with it every
@@ -1140,7 +1302,7 @@ local function source_pixels(sid, ci, strength)
     if not data then return false end
     local pal = palette_of(ci)
     if not pal then return false end
-    return tinted_entries(pal, strength, data.list, data.idx), data.idx
+    return tinted_entries(pal, strength, data.list, data.idx, nil, nil, data.mean), data.idx
 end
 
 -- A source's pixel list and 1024 indices: a picture read off DF, or for a
@@ -1225,8 +1387,6 @@ local function tint_texpos(sid, code, strength, budget)
     if not per then per = {} store[sid] = per end
     local handle = per[code]
     if handle == nil then
-        if budget <= 0 or not can_work() then return nil, budget end
-        budget = budget - 1
         local t0 = clock()
         local entries, idx = source_pixels(sid, code - 1, strength)
         handle = entries and make_texture(idx, entries) or false
@@ -1314,11 +1474,12 @@ local function overlay_case(token)
     for _, name in ipairs(CASE_ORDER) do if has[name] then keep[#keep + 1] = name end end
     return #keep > 0 and table.concat(keep, ' ') or nil
 end
--- The pieces' tokens: {'stone', n} and {'soil', n}.
+-- The pieces' tokens: {'stone', n}, {'soil', n} and {'pebbles', n}.
 local PIECE_TOKENS = {}
 for n = 1, 9 do
     PIECE_TOKENS['STONE_FLOOR_' .. n] = {'stone', n}
     PIECE_TOKENS['DIRT_FLOOR_' .. n] = {'soil', n}
+    PIECE_TOKENS['PEBBLES_FLOOR_' .. n] = {'pebbles', n}
 end
 
 -- A loaded page's texpos at cell x, y, or nil.
@@ -1330,17 +1491,46 @@ local function cell_texpos(page, x, y)
     return t > 0 and t or nil
 end
 
--- Every definition of a wanted token in the graphics raws, in load order:
+-- Every definition of a wanted token in the graphics raws, in DF's load order:
 -- defs[token] = {{t=texpos, page=, x=, y=}, ...}; and the folders and files read.
 local function read_raws()
+    local roots = {dfhack.filesystem.getBaseDir()}
+    local ok_u, user = pcall(function() return dfhack.filesystem.getUserDir() end)
+    if ok_u and type(user) == 'string' then roots[#roots + 1] = user end
+    local appdata = os.getenv('APPDATA')
+    if appdata then roots[#roots + 1] = appdata .. '/Bay 12 Games/Dwarf Fortress/' end
+    roots[#roots + 1] = ''
+    local function resolve_dir(p)
+        for _, root in ipairs(roots) do
+            local sep = (root == '' or root:match('[/\\]$')) and '' or '/'
+            local cand = root .. sep .. p
+            if dfhack.filesystem.isdir(cand) then return cand:gsub('\\', '/'):gsub('/+$', '') end
+        end
+    end
     local pages = df.global.texture.page
-    local dirs, by_dir, by_name = {}, {}, {}
+    local dirs, seen_dir, by_dir, by_name = {}, {}, {}, {}
+    local function add_dir(d)
+        if not d or d == '' then return end
+        local key = d:gsub('\\', '/'):gsub('/+$', ''):lower()
+        if not seen_dir[key] then seen_dir[key] = true dirs[#dirs + 1] = d end
+    end
+    -- Walk DF's actual object load order first (vanilla, then active mods in order).
+    pcall(function()
+        for _, p in ipairs(df.global.world.object_loader.object_load_order_src_dir) do
+            if type(p) ~= 'string' then p = p.value end
+            local base = resolve_dir(p)
+            local g = base and (base .. '/graphics')
+            if g and dfhack.filesystem.isdir(g) then add_dir(g) end
+        end
+    end)
     for pi = 0, #pages - 1 do
         local page = pages[pi]
         local ok, dir = pcall(function() return page.graphics_dir end)
         if ok and type(dir) == 'string' and dir ~= '' then
-            if not by_dir[dir] then by_dir[dir] = {} dirs[#dirs + 1] = dir end
-            by_dir[dir][page.token] = page
+            local resolved = resolve_dir(dir) or dir
+            if not by_dir[resolved] then by_dir[resolved] = {} end
+            by_dir[resolved][page.token] = page
+            add_dir(resolved)
         end
         by_name[page.token] = page
     end
@@ -1348,12 +1538,16 @@ local function read_raws()
     for _, dir in ipairs(dirs) do
         local paths = {}
         for _, folder in ipairs({dir, dir .. '/..'}) do
-            local ok, names = pcall(dfhack.filesystem.listdir, folder)
-            for _, name in ipairs(ok and names or {}) do
-                if name:lower():match('%.txt$') then paths[#paths + 1] = folder .. '/' .. name end
+            local ok, entries = pcall(dfhack.filesystem.listdir_recursive, folder, 4, false)
+            for _, f in ipairs(ok and entries or {}) do
+                if not f.isdir and f.path:lower():match('%.txt$') then
+                    paths[#paths + 1] = folder .. '/' .. f.path:gsub('^[/\\]+', '')
+                end
             end
             if #paths > 0 then break end
         end
+        table.sort(paths)
+        local dir_pages = by_dir[dir]
         for _, path in ipairs(paths) do
             local f = io.open(path, 'r')
             local text = ''
@@ -1363,10 +1557,10 @@ local function read_raws()
                 files = files + 1
             end
             if text:find('_FLOOR_', 1, true) or text:find('OVERLAY_RAMP_', 1, true) then
-                for pname, x, y, token in text:gmatch('%[TILE_GRAPHICS:([^:%]]+):(%d+):(%d+):([^:%]]+)%]') do
+                for pname, x, y, token in text:gmatch('%[TILE_GRAPHICS:([^:%]]+):(%d+):(%d+):([^:%]]+)') do
                     if PIECE_TOKENS[token] or overlay_case(token) then
                         x, y = tonumber(x), tonumber(y)
-                        local t = cell_texpos(by_dir[dir][pname] or by_name[pname], x, y)
+                        local t = cell_texpos((dir_pages and dir_pages[pname]) or by_name[pname], x, y)
                         if t then
                             local list = defs[token]
                             if not list then list = {} defs[token] = list end
@@ -1418,7 +1612,7 @@ refresh_tokens = function(force)
     local ok, defs, dirs, files = pcall(read_raws)
     if not ok then defs, dirs, files = {}, 0, 0 end
     local values = next(defs) and table_values() or {}
-    local stone, soil, overlay, overlay_set, checks, found = {}, {}, {}, {}, {}, 0
+    local stone, soil, pebbles, overlay, overlay_set, checks, found = {}, {}, {}, {}, {}, {}, 0
     for token, list in pairs(defs) do
         local pick = list[#list]
         if not values[pick.t] then
@@ -1428,7 +1622,7 @@ refresh_tokens = function(force)
         end
         local piece = PIECE_TOKENS[token]
         if piece then
-            (piece[1] == 'stone' and stone or soil)[piece[2]] = pick.t
+            (piece[1] == 'stone' and stone or piece[1] == 'soil' and soil or pebbles)[piece[2]] = pick.t
         else
             overlay[overlay_case(token)] = pick.t
             overlay_set[pick.t] = true
@@ -1436,7 +1630,8 @@ refresh_tokens = function(force)
         found = found + 1
         checks[#checks + 1] = {pick.page, pick.x, pick.y, dfhack.screen.findGraphicsTile(pick.page, pick.x, pick.y)}
     end
-    tokens.stone, tokens.soil, tokens.overlay, tokens.overlay_set = stone, soil, overlay, overlay_set
+    tokens.stone, tokens.soil, tokens.pebbles, tokens.overlay, tokens.overlay_set =
+        stone, soil, pebbles, overlay, overlay_set
     tokens.checks, tokens.dirs, tokens.files, tokens.found = checks, dirs, files, found
     -- the overlays hidden under the old textures are put back and hidden again under the
     -- new ones (update_ramp_overlays); the pieces and overlays drawn from the old go
@@ -1887,18 +2082,30 @@ local function fog_copy(t)
     return copy
 end
 
--- Each frame: the fog layer of the levels below, made black.
-local function paint_fog()
+-- Each frame: the fog layer of the levels below, made black. When cells/n are
+-- passed, scans only the open cells where lower_viewport[0] actually shows.
+local function paint_fog(cells, n)
     if not state.black_shadows or not stone_tint_shades.applied then return end
     local lvp = df.global.gps.lower_viewport[0]
     if not lvp or not lvp.flag.active then return end
     fog_reads = FOG_READS_PER_FRAME
     local layer = lvp.screentexpos_interface
-    for i = 0, lvp.dim_x * lvp.dim_y - 1 do
-        local t = layer[i]
-        if t ~= 0 then
-            local copy = fog_copy(t)
-            if copy then layer[i] = copy end
+    if cells then
+        for k = 1, n do
+            local i = cells[k]
+            local t = layer[i]
+            if t ~= 0 then
+                local copy = fog_copy(t)
+                if copy then layer[i] = copy end
+            end
+        end
+    else
+        for i = 0, lvp.dim_x * lvp.dim_y - 1 do
+            local t = layer[i]
+            if t ~= 0 then
+                local copy = fog_copy(t)
+                if copy then layer[i] = copy end
+            end
         end
     end
 end
@@ -1922,7 +2129,7 @@ end
 local tile_kind
 do
 local S = df.tiletype_shape
-local FLOOR_LIKE = {[S.FLOOR] = true, [S.BOULDER] = true}
+local FLOOR_LIKE = {[S.FLOOR] = true, [S.BOULDER] = true, [S.PEBBLES] = true}
 local NEVER_SHAPES = {[S.WALL] = true, [S.FORTIFICATION] = true, [S.EMPTY] = true, [S.RAMP_TOP] = true}
 local NEVER_MATERIALS = {}
 for _, name in ipairs({'GRASS_LIGHT', 'GRASS_DARK', 'GRASS_DRY', 'GRASS_DEAD'}) do
@@ -1931,15 +2138,15 @@ for _, name in ipairs({'GRASS_LIGHT', 'GRASS_DARK', 'GRASS_DRY', 'GRASS_DEAD'}) 
 end
 local RAMP, SMOOTH = S.RAMP, df.tiletype_special.SMOOTH
 tile_kind = function(x, y, z, flag)
-    local tt = dfhack.maps.getTileType(x, y, z)
-    if not tt then return false, false end
-    local material, tshape, special = tile_attrs(tt)
+    local b = fast.block(x, y, z)
+    if not b then return false, false end
+    local idx = (x & 15) * 16 + (y & 15)
+    local material, tshape, special = tile_attrs(b.tt[idx])
     -- (a grass ramp still gets its overlay: RAMP_OTHER, below)
     if NEVER_SHAPES[tshape] or (NEVER_MATERIALS[material] and tshape ~= RAMP) then return false, true end
     local stair = STAIR_SHAPES[tshape]
     if not (stair or tshape == RAMP or FLOOR_LIKE[tshape]) then return false, false end
-    local des = dfhack.maps.getTileFlags(x, y, z)
-    if des and des.hidden then return false, false end
+    if (b.des[idx] & fast.m_hidden) ~= 0 then return false, false end
     local family = STONE_MATERIALS[material] and 'stone' or (material == MAT_SOIL and 'soil') or nil
     if family == 'soil' and is_sand(x, y, z) then family = nil end
     if not family then return tshape == RAMP and RAMP_OTHER or false, false end
@@ -1958,6 +2165,8 @@ end
 
 -- Whether a tile is subterranean (Detailed Weather's test for underground).
 local function is_subterranean(x, y, z)
+    local b = fast.block(x, y, z)
+    if b then return (b.des[(x & 15) * 16 + (y & 15)] & fast.m_sub) ~= 0 end
     local des = dfhack.maps.getTileFlags(x, y, z)
     return des and des.subterranean or false
 end
@@ -1974,8 +2183,9 @@ local function load_state()
         if saved[k] ~= nil then state[k] = saved[k] end
     end
     -- (v1.2) "Ramp overlays", in place of "Hide ramp overlays": a save from before
-    -- v1.2 has none, and takes the default (tinted).
+    -- v1.2 has none, and takes the default (hidden).
     if OVERLAY_MODES[saved.overlays] then state.overlays = saved.overlays end
+    if edge.modes[saved.edges] then state.edges = saved.edges end
 end
 
 local function save_state()
@@ -1992,6 +2202,7 @@ local function reset_cache(z)
     cached_z = z
     color_cache = {}
     tile_checks = {}
+    edge.sources = {}
     reset_known()
 end
 
@@ -2013,6 +2224,9 @@ local function change_level(z)
     end
     for lz in pairs(tile_checks) do
         if math.abs(lz - z) > KEEP_LEVELS then tile_checks[lz] = nil end
+    end
+    for lz in pairs(edge.sources) do
+        if math.abs(lz - z) > KEEP_LEVELS then edge.sources[lz] = nil end
     end
     reset_known()
 end
@@ -2119,24 +2333,38 @@ local function over_pixel(under, over)
     end
     return (math.floor(a + 0.5) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 end
+ramp.over_pixel = over_pixel
 
--- Ramp picture sid with overlay ov laid in: tinted with colour code `code` at
--- strength, or as drawn when code is nil. Pixels, or nil.
+-- Ramp picture sid with overlay ov laid in: composited as drawn first, then
+-- tinted as one picture so monochrome shadow/highlight overlays darken and
+-- brighten naturally instead of shifting into a flat single colour.
 local function laid_pixels(sid, ov, code, strength)
     local list, idx = source_data(sid)
     local olist, oidx = source_data(ov)
     if not list or not olist then return nil end
-    local under, over
-    if code then
-        local pal = palette_of(code - 1)
-        if not pal then return nil end
-        under = tinted_entries(pal, strength, list, idx)
-        over = tinted_entries(pal, strength, olist, oidx, list, idx)
-    else
-        under, over = drawn_entries(list), drawn_entries(olist)
-    end
+    local under, over = drawn_entries(list), drawn_entries(olist)
     local out = {}
     for j = 1, CELL_PX * CELL_PX do out[j] = over_pixel(under[idx[j]], over[oidx[j]]) end
+    if not code then return out end
+    local pal = palette_of(code - 1)
+    if not pal then return nil end
+    local clist, cidx, seen = {{0, 0, 0, 0, 0}}, {}, {}
+    for j = 1, CELL_PX * CELL_PX do
+        local packed = out[j]
+        local i = 1
+        if packed >> 24 > 0 then
+            i = seen[packed]
+            if not i then
+                local r, g, b = packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF
+                clist[#clist + 1] = {r, g, b, packed >> 24, key_of(r, g, b)}
+                i = #clist
+                seen[packed] = i
+            end
+        end
+        cidx[j] = i
+    end
+    local entries = tinted_entries(pal, strength, clist, cidx)
+    for j = 1, CELL_PX * CELL_PX do out[j] = entries[cidx[j]] end
     return out
 end
 
@@ -2173,8 +2401,6 @@ function ramp.texpos(sid, ov, code)
     if not store then store = {} stores[skey] = store end
     local handle = store[key]
     if handle == nil then
-        if frame_budget <= 0 or not can_work() then return nil end
-        frame_budget = frame_budget - 1
         local t0 = clock()
         local px = laid_pixels(sid, ov, code, frame_strength)
         handle = false
@@ -2233,13 +2459,12 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     -- screen did at each change of weather). A texture's first sight since the
     -- last reset also files it: never looked at again when no picture on a
     -- tile like this one is ours.
-    local original = dw_original(drawn)
+    local original = dw_memo.active and dw_original(drawn) or nil
     local key = original or drawn
     local ccol = checks[wx]
     if not ccol then ccol = {} checks[wx] = ccol end
     local check = ccol[wy]
     if not check or check.texpos ~= key then
-        if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
         local t0 = clock()
         local id, never = tile_kind(wx, wy, z, flags[index])
         check = {texpos=key, id=id, never=never}
@@ -2262,7 +2487,6 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     if not col then col = {} colours[wx] = col end
     local code = col[wy]
     if not code then
-        if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
         local t0 = clock()
         code = lookup_colour(wx, wy, z)
         col[wy] = code
@@ -2278,7 +2502,6 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     local src = drawn
     if original then
         if check.under == nil then
-            if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
             local t0 = clock()
             check.under = is_subterranean(wx, wy, z)
             this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
@@ -2320,7 +2543,7 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
             -- FLOOR EDGES: a floor's tinted texture is filed with its colour and
             -- picture, which the pieces it drops take, as it is made.
             if texpos and (kind == K_FLOOR or kind == K_ENGRAVED) then
-                edge.info[texpos] = {code=code, sid=sid}
+                edge.info[texpos] = {code=code, sid=sid, under=check.under or false}
             end
         end
     end
@@ -2386,7 +2609,7 @@ end
 -- a corner piece from a floor that only touches the cell diagonally (not yet
 -- measured).
 local paint_edges
-do
+(function()
 -- floor_flag's side bytes, lowest first, each with the floor that drops its
 -- edge there (dx, dy in cells) and the piece of that floor's set that lands.
 local SIDES = {
@@ -2411,42 +2634,188 @@ local p_sid, p_code, p_fsid, parts = {}, {}, {}, {}
 
 -- The pieces by edging ID: DF's own (DF'S OWN PIECES AND OVERLAYS), and the
 -- art id of our stored copy of piece 1 (for a picture that cannot be read).
-local EDGINGS = {[9] = {'stone', 1}, [2] = {'soil', FIRST_SOIL_FLOOR}}
+local EDGINGS = {[9] = {'stone', 1}, [8] = {'pebbles', 1}, [2] = {'soil', FIRST_SOIL_FLOOR}}
+
+-- Per-frame resolved edge piece sources and canonical piece-5 floor shift
+-- sources, so add_piece never calls dw_shown/source_for per cell and keeps one
+-- canonical shift per edging family instead of multiplying by every floor/pebble variant.
+local surf_sid = {[9] = {}, [8] = {}, [2] = {}}
+local under_sid = {[9] = {}, [8] = {}, [2] = {}}
+local surf_fsid, under_fsid = {}, {}
+local resolved_frame = -1
+local stored_mean, stored_opaque = {}, {}
+
+local function resolve_edge_pieces()
+    resolved_frame = frame_id
+    local dw_on = dw_memo.active
+    for _, id in ipairs({9, 8, 2}) do
+        local e = EDGINGS[id]
+        local tk, base = tokens[e[1]], e[2]
+        local ss, us = surf_sid[id], under_sid[id]
+        for p = 1, 9 do
+            local t = tk[p]
+            if t then
+                local sid = source_for(dw_on and dw_shown(t) or t)
+                ss[p] = sid or -(base + p - 1)
+                us[p] = dw_on and (source_for(t) or -(base + p - 1)) or ss[p]
+            else
+                ss[p], us[p] = nil, nil
+            end
+        end
+        local f5 = tk[5]
+        if f5 then
+            local sid = source_for(dw_on and dw_shown(f5) or f5)
+            surf_fsid[id] = sid or -(base + 4)
+            under_fsid[id] = dw_on and (source_for(f5) or -(base + 4)) or surf_fsid[id]
+        else
+            surf_fsid[id], under_fsid[id] = -(base + 4), -(base + 4)
+        end
+    end
+end
+
+local function source_mean(sid)
+    if sid > 0 then
+        local d = stone_tint_sources.data[sid]
+        if not d then return nil end
+        if not d.mean then
+            local sr, sg, sb, n = 0, 0, 0, 0
+            local list, idx = d.list, d.idx
+            for i = 1, #idx do
+                local e = list[idx[i]]
+                if e[4] > 0 then sr, sg, sb, n = sr + e[1], sg + e[2], sb + e[3], n + 1 end
+            end
+            if n == 0 then n = 1 end
+            d.mean = {sr / n, sg / n, sb / n}
+        end
+        return d.mean
+    end
+    local m = stored_mean[-sid]
+    if m then return m end
+    local list, idx = source_data(sid)
+    if not list then return nil end
+    local sr, sg, sb, n = 0, 0, 0, 0
+    for i = 1, #idx do
+        local e = list[idx[i]]
+        if e[4] > 0 then sr, sg, sb, n = sr + e[1], sg + e[2], sb + e[3], n + 1 end
+    end
+    if n == 0 then n = 1 end
+    m = {sr / n, sg / n, sb / n}
+    stored_mean[-sid] = m
+    return m
+end
+
+local function source_opaque(sid)
+    if sid > 0 then
+        local d = stone_tint_sources.data[sid]
+        if not d then return nil end
+        if not d.opaque then
+            local op, on = {}, 0
+            local list, idx = d.list, d.idx
+            for j = 1, #idx do
+                local i = idx[j]
+                if list[i][4] > 0 then
+                    on = on + 2
+                    op[on - 1], op[on] = j, i
+                end
+            end
+            d.opaque = op
+        end
+        return d.opaque
+    end
+    local op = stored_opaque[-sid]
+    if op then return op end
+    local list, idx = source_data(sid)
+    if not list then return nil end
+    op = {}
+    local on = 0
+    for j = 1, #idx do
+        local i = idx[j]
+        if list[i][4] > 0 then
+            on = on + 2
+            op[on - 1], op[on] = j, i
+        end
+    end
+    stored_opaque[-sid] = op
+    return op
+end
+
+local function floor_pixels(sid, code, strength)
+    local by_sid = edge.floor_px[sid]
+    if not by_sid then by_sid = {} edge.floor_px[sid] = by_sid end
+    local px = by_sid[code]
+    if px then return px end
+    local list, idx = source_data(sid)
+    local pal = palette_of(code - 1)
+    if not list or not pal then return nil end
+    local mrgb = state.style == 'keep' and source_mean(sid) or nil
+    local entries = tinted_entries(pal, strength, list, idx, nil, nil, mrgb)
+    px = {}
+    for j = 1, CELL_PX * CELL_PX do px[j] = entries[idx[j]] end
+    by_sid[code] = px
+    return px
+end
+
+local function piece_pixels(sid, code, fsid, strength)
+    local by_sid = edge.piece_px[sid]
+    if not by_sid then by_sid = {} edge.piece_px[sid] = by_sid end
+    local px = by_sid[code]
+    if px then return px end
+    local list, idx = source_data(sid)
+    local pal = palette_of(code - 1)
+    if not list or not pal then return nil end
+    local mrgb = state.style == 'keep' and source_mean(fsid) or nil
+    local entries = tinted_entries(pal, strength, list, idx, nil, nil, mrgb)
+    local op = source_opaque(sid)
+    if not op then return nil end
+    px = {}
+    local k = 0
+    for m = 1, #op, 2 do
+        k = k + 2
+        px[k - 1] = op[m]
+        px[k] = entries[op[m + 1]]
+    end
+    by_sid[code] = px
+    return px
+end
 
 -- Puts piece `piece` of edging `id`'s set on top of the stack of n, tinted as
--- floor f (an edge.info entry). Returns the new count, or nil while the piece
--- waits for a read or DF's piece was not found: then the cell keeps DF's own
--- edges this frame.
+-- floor f using its edging family's canonical shift.
 local function add_piece(n, f, id, piece)
-    local e = EDGINGS[id]
-    local texpos = e and tokens[e[1]][piece]
-    if not texpos then return nil end
-    -- (under a Detailed Weather look, its copy of the piece: what DF draws)
-    local sid = source_for(dw_shown(texpos))
-    if sid == nil then return nil end
-    -- Cannot be read: our stored copy of that piece.
-    if not sid then sid = -(e[2] + piece - 1) end
+    local sid = (f.under and under_sid or surf_sid)[id][piece]
+    if not sid then return nil end
     n = n + 1
-    p_sid[n], p_code[n], p_fsid[n] = sid, f.code, f.sid
+    p_sid[n], p_code[n], p_fsid[n] = sid, f.code, (f.under and under_fsid or surf_fsid)[id]
     return n
 end
 
--- The stack as one texture's pixels, each piece tinted and laid over the ones
--- before it. Every floor piece in vanilla's and Landscapes' sets is fully
--- opaque where it is drawn (checked 2026-11-15), so a visible pixel simply
--- replaces the one under it. Returns a handle, or false.
-local function stack_texture(n, strength)
+-- The stack as one texture's pixels: copies pre-tinted floor pixels (if baked)
+-- and stamps only the pre-tinted opaque pixels of each edge piece and spatter.
+local function stack_texture(n, strength, floor_info, sp_sid)
     local out = {}
-    for j = 1, CELL_PX * CELL_PX do out[j] = 0 end
+    local blend = ramp.over_pixel
+    if floor_info then
+        local fpx = floor_pixels(floor_info.sid, floor_info.code, strength)
+        if not fpx then return false end
+        for j = 1, CELL_PX * CELL_PX do out[j] = fpx[j] end
+    else
+        for j = 1, CELL_PX * CELL_PX do out[j] = 0 end
+    end
     for i = 1, n do
-        local list, idx = source_data(p_sid[i])
-        local pal = palette_of(p_code[i] - 1)
-        if not list or not pal then return false end
-        local mlist, midx = source_data(p_fsid[i])
-        local entries = tinted_entries(pal, strength, list, idx, mlist, midx)
-        for j = 1, CELL_PX * CELL_PX do
-            local v = entries[idx[j]]
-            if v >> 24 > 0 then out[j] = v end
+        local ppx = piece_pixels(p_sid[i], p_code[i], p_fsid[i], strength)
+        if not ppx then return false end
+        for m = 1, #ppx, 2 do
+            local j, v = ppx[m], ppx[m + 1]
+            if (v >> 24) == 255 then out[j] = v else out[j] = blend(out[j], v) end
+        end
+    end
+    if sp_sid then
+        local slist = source_data(sp_sid)
+        local sop = source_opaque(sp_sid)
+        if not slist or not sop then return false end
+        for m = 1, #sop, 2 do
+            local j = sop[m]
+            local e = slist[sop[m + 1]]
+            out[j] = blend(out[j], (e[4] << 24) | (e[3] << 16) | (e[2] << 8) | e[1])
         end
     end
     local ok, handles = pcall(dfhack.textures.createTileset, out, CELL_PX, CELL_PX,
@@ -2455,21 +2824,35 @@ local function stack_texture(n, strength)
     return false
 end
 
--- The texpos for the stack of n, made on its first request within the frame's
--- texture budget, as tint_texpos does a floor's. Returns texpos, false
--- (nothing to draw) or nil (not this frame).
-local function stack_texpos(n)
-    -- Keep's result depends on the floor's picture too; the others' do not.
-    local keep = state.style == 'keep'
+-- Zero-allocation trie lookup for the stack of n (with optional floor_info
+-- underneath or sp_sid on top); only builds a string key on a cache miss.
+local function stack_texpos(n, floor_info, sp_sid)
+    local node = edge.made
+    local fk = floor_info and (floor_info.sid * 65536 + floor_info.code) or 0
+    local nxt = node[fk]
+    if not nxt then nxt = {} node[fk] = nxt end
+    node = nxt
     for i = 1, n do
-        parts[i] = keep and (p_sid[i] .. ':' .. p_code[i] .. ':' .. p_fsid[i])
-            or (p_sid[i] .. ':' .. p_code[i])
+        local pk = p_sid[i] * 65536 + p_code[i]
+        nxt = node[pk]
+        if not nxt then nxt = {} node[pk] = nxt end
+        node = nxt
+    end
+    if sp_sid then
+        local sp = node.sp
+        if not sp then sp = {} node.sp = sp end
+        nxt = sp[sp_sid]
+        if not nxt then nxt = {} sp[sp_sid] = nxt end
+        node = nxt
+    end
+    local texpos = node.t
+    if texpos ~= nil then return texpos end
+    for i = 1, n do
+        parts[i] = p_sid[i] .. ':' .. p_code[i]
     end
     local key = table.concat(parts, ' ', 1, n)
-    local texpos = edge.made[key]
-    if texpos ~= nil then return texpos end
-    -- The handles live with the floors' textures, one store per style and
-    -- strength, so they go when those do and a console re-run keeps them.
+    if floor_info then key = 'f' .. floor_info.sid .. ':' .. floor_info.code .. ' ' .. key end
+    if sp_sid then key = key .. ' s' .. sp_sid end
     local stores = stone_tint_textures.edges
     if not stores then stores = {} stone_tint_textures.edges = stores end
     local skey = state.style .. frame_strength
@@ -2477,108 +2860,206 @@ local function stack_texpos(n)
     if not store then store = {} stores[skey] = store end
     local handle = store[key]
     if handle == nil then
-        if frame_budget <= 0 or not can_work() then return nil end
-        frame_budget = frame_budget - 1
         local t0 = clock()
-        handle = stack_texture(n, frame_strength)
+        handle = stack_texture(n, frame_strength, floor_info, sp_sid)
         this_frame.made, this_frame.made_s = this_frame.made + 1, this_frame.made_s + clock() - t0
         store[key] = handle
         if handle then stone_tint_stats.textures = stone_tint_stats.textures + 1 end
     end
     if not handle then
-        edge.made[key] = false
+        node.t = false
         return false
     end
     local t = dfhack.textures.getTexposByHandle(handle)
-    -- 0 means DFHack is holding the texture until DF finishes loading.
     if t and t > 0 then
-        edge.made[key], edge.ours[t] = t, true
+        node.t = t
+        if not floor_info then edge.ours[t] = true end
         return t
     end
     return nil
 end
 
--- One open cell's stack: the texpos for its edging (flag) at screen cell sx,
--- sy, or nil when no side's floor is ours or a piece waits for a read.
-local function cell_stack(flag, sx, sy, bg, dim_x, dim_y, info)
-    -- Each side with stone or soil edging: is the floor that drops it one of ours?
-    local any = false
+local S_FLOOR, S_BOULDER, S_PEBBLES = df.tiletype_shape.FLOOR, df.tiletype_shape.BOULDER,
+    df.tiletype_shape.PEBBLES
+local ROUGH_SPECIALS = {
+    [df.tiletype_special.NORMAL] = true,
+    [df.tiletype_special.WET] = true,
+}
+
+-- Map-level fallback for a rough floor at (wx, wy, z) when it isn't in
+-- edge.info (1 tile off-screen or hidden under a shaft overhang).
+-- Returns 9 (stone), 8 (pebbles), 2 (soil), or false.
+local function edge_source(wx, wy, z)
+    local b = fast.block(wx, wy, z)
+    if not b then return false end
+    local idx = (wx & 15) * 16 + (wy & 15)
+    local material, tshape, special = tile_attrs(b.tt[idx])
+    if (tshape ~= S_FLOOR and tshape ~= S_BOULDER and tshape ~= S_PEBBLES)
+            or not ROUGH_SPECIALS[special] then
+        return false
+    end
+    local id = STONE_MATERIALS[material] and (tshape == S_PEBBLES and 8 or 9)
+        or (material == MAT_SOIL and 2) or false
+    if not id then return false end
+    if (b.des[idx] & fast.m_hidden) ~= 0 then return false end
+    if id == 2 and is_sand(wx, wy, z) then return false end
+    return id
+end
+
+local function map_floor_info(wx, wy, z, id, colours)
+    if not group_enabled[(id == 9 or id == 8) and G_ROUGH or G_SOIL_FLOORS] then return false end
+    if wx < 0 or wy < 0 or wx >= map_max_x or wy >= map_max_y then return false end
+    local zsrc = edge.sources[z]
+    if not zsrc then zsrc = {} edge.sources[z] = zsrc end
+    local scol = zsrc[wx]
+    if not scol then scol = {} zsrc[wx] = scol end
+    local src_id = scol[wy]
+    if src_id == nil then
+        local t0 = clock()
+        src_id = edge_source(wx, wy, z)
+        scol[wy] = src_id
+        this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
+    end
+    if src_id ~= id then return false end
+    local col = colours[wx]
+    if not col then col = {} colours[wx] = col end
+    local code = col[wy]
+    if not code then
+        local t0 = clock()
+        code = lookup_colour(wx, wy, z)
+        col[wy] = code
+        this_frame.colours, this_frame.colour_s = this_frame.colours + 1, this_frame.colour_s + clock() - t0
+    end
+    if code == 0 then return false end
+    local f = edge.fallback[code]
+    if not f then f = {code=code, under=false} edge.fallback[code] = f end
+    return f
+end
+
+local side_id = {}
+
+-- Collects the tinted edge pieces for a cell's edging (flag). Checks the
+-- visible viewport buffer first (zero map reads), falling back to the map when
+-- the neighbor is off-screen or hidden under a shaft overhang.
+local function cell_pieces(b0, b1, b2, b3, sx, sy, bg, dim_x, dim_y, info, win_x, win_y, z, colours)
+    side_id[1], side_id[2], side_id[3], side_id[4] = b0, b1, b2, b3
+    local any, clear = false, 0
     for s = 1, 4 do
-        local side = SIDES[s]
+        local id = side_id[s]
         local f = false
-        if EDGINGS[(flag >> side.shift) & 0xFF] then
+        if EDGINGS[id] then
+            local side = SIDES[s]
             local nx, ny = sx + side.dx, sy + side.dy
             if nx >= 0 and nx < dim_x and ny >= 0 and ny < dim_y then
                 f = info[bg[nx * dim_y + ny]] or false
-                if f then any = true end
+            end
+            if not f then
+                f = map_floor_info(win_x + nx, win_y + ny, z, id, colours)
+            end
+            if f then
+                any = true
+                clear = clear | (0xFF << side.shift)
             end
         end
         taken[s] = f
     end
-    if not any then return nil end
+    if not any then return nil, 0 end
     -- Corners first, so the sides lie over them.
     local np = 0
     for c = 1, 4 do
         local corner = CORNERS[c]
         local a, b = corner.a, corner.b
-        local id = (flag >> SIDES[a].shift) & 0xFF
-        if np and (taken[a] or taken[b]) and EDGINGS[id]
-                and (flag >> SIDES[b].shift) & 0xFF == id then
+        local id = side_id[a]
+        if np and (taken[a] or taken[b]) and EDGINGS[id] and side_id[b] == id then
             local f
             local nx, ny = sx + corner.dx, sy + corner.dy
             if nx >= 0 and nx < dim_x and ny >= 0 and ny < dim_y then
                 f = info[bg[nx * dim_y + ny]]
+            end
+            if not f then
+                f = map_floor_info(win_x + nx, win_y + ny, z, id, colours) or nil
             end
             np = add_piece(np, f or taken[a] or taken[b], id, corner.piece)
         end
     end
     for s = 1, 4 do
         if np and taken[s] then
-            np = add_piece(np, taken[s], (flag >> SIDES[s].shift) & 0xFF, SIDES[s].piece)
+            np = add_piece(np, taken[s], side_id[s], SIDES[s].piece)
         end
     end
-    if not np or np == 0 then return nil end
-    return stack_texpos(np) or nil
+    if not np or np == 0 then return nil, 0 end
+    return np, clear
 end
 
--- One level's cells (cells, 1 to n: indices into port's buffers, or nil for
--- every index 0 to n - 1; bg its screentexpos_background): each with edging
--- gets its tinted pieces.
-paint_edges = function(port, bg, cells, n, dim_x, dim_y)
-    if n == 0 then return end
+-- One level's cells: each with edging gets its tinted pieces.
+-- smart: bakes tinted edges into a tinted floor's bg when DF's own edges
+-- (grass) or spatter (snow/mud/leaves) share the cell, and composites spatter
+-- on top in bg2 for untinted cells, clearing our handled side bytes in
+-- floor_flag so DF draws everything in its native order.
+-- simple: writes tinted edges into bg2 over whatever DF draws.
+-- off: leaves all floor edges to DF.
+paint_edges = function(port, bg, cells, n, dim_x, dim_y, win_x, win_y, z, colours)
+    if n == 0 or state.edges == 'off' then return end
     local ff, bg2 = port.screentexpos_floor_flag, port.screentexpos_background_two
     if not ff or not bg2 then return end
+    if resolved_frame ~= frame_id then resolve_edge_pieces() end
+    local spatter = port.screentexpos_spatter
+    local smart = state.edges ~= 'simple'
     local info, ours = edge.info, edge.ours
     for k = 1, n do
         local cell = cells and cells[k] or k - 1
         local flag = ff[cell]
-        if flag ~= 0 then
-            local held = bg2[cell]
-            -- A stack of ours from an earlier frame still in place would mean
-            -- DF does not draw background_two afresh each frame, as it does
-            -- the background. Not yet measured, so it is counted for
-            -- `stone-tint status`, and the cell is redone as if empty, and
-            -- emptied if it gets nothing now, so a lip never sticks.
-            local stale = held ~= 0 and ours[held]
-            if stale then
-                stone_tint_stats.edges_kept = (stone_tint_stats.edges_kept or 0) + 1
-                held = 0
-            end
-            local texpos
-            if held == 0 and flag >> 32 == 0 then
+        if flag ~= 0 and flag >> 32 == 0 then
+            local b0 = flag & 0xFF
+            local b1 = (flag >> 8) & 0xFF
+            local b2 = (flag >> 16) & 0xFF
+            local b3 = (flag >> 24) & 0xFF
+            if EDGINGS[b0] or EDGINGS[b1] or EDGINGS[b2] or EDGINGS[b3] then
+                local held = bg2[cell]
+                local stale = held ~= 0 and ours[held]
+                if stale then
+                    stone_tint_stats.edges_kept = (stone_tint_stats.edges_kept or 0) + 1
+                    held = 0
+                end
+                local wrote_bg2 = false
                 local sx = cell // dim_y
-                texpos = cell_stack(flag, sx, cell - sx * dim_y, bg, dim_x, dim_y, info)
-            end
-            if texpos then
-                bg2[cell] = texpos
-                edge.count = edge.count + 1
-            elseif stale then
-                bg2[cell] = 0
+                local np, clear = cell_pieces(b0, b1, b2, b3, sx, cell - sx * dim_y, bg,
+                    dim_x, dim_y, info, win_x, win_y, z, colours)
+                if np then
+                    local sp = smart and spatter and spatter[cell] or 0
+                    local floor_info = smart and info[bg[cell]] or nil
+                    local rem_edges = ((flag & ~clear) & 0xFFFFFFFF) ~= 0
+                    if floor_info and (rem_edges or sp ~= 0) then
+                        local texpos = stack_texpos(np, floor_info, nil)
+                        if texpos then
+                            ff[cell] = flag & ~clear
+                            bg[cell] = texpos
+                            info[texpos] = floor_info
+                            edge.count = edge.count + 1
+                        end
+                    elseif held == 0 then
+                        local sp_sid
+                        if smart and sp ~= 0 then
+                            sp_sid = source_for(sp)
+                            if not sp_sid then np = nil end
+                        end
+                        if np then
+                            local texpos = stack_texpos(np, nil, sp_sid)
+                            if texpos then
+                                if smart then ff[cell] = flag & ~clear end
+                                bg2[cell] = texpos
+                                wrote_bg2 = true
+                                edge.count = edge.count + 1
+                            end
+                        end
+                    end
+                end
+                if stale and not wrote_bg2 then bg2[cell] = 0 end
             end
         end
     end
 end
-end
+end)()
 
 -- DF rebuilds screentexpos_background from scratch every rendered frame. This
 -- was measured, not assumed: writing a sentinel into the buffer and reading it
@@ -2662,12 +3143,17 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     -- The shadows go with neither the tint nor its strength (SHADOWS AND FOG).
     update_ramp_overlays()
     update_shades()
-    paint_fog()
+    local strength = state.strength
+    if strength == 0 or not art then
+        paint_fog()
+        local upkeep = (clock() - started) * 1000
+        stone_tint_stats.fog_ms = timed_average(stone_tint_stats.fog_ms, upkeep)
+        stone_tint_stats.upkeep_worst_ms = math.max(stone_tint_stats.upkeep_worst_ms or 0, upkeep)
+        return
+    end
     local upkeep = (clock() - started) * 1000
     stone_tint_stats.fog_ms = timed_average(stone_tint_stats.fog_ms, upkeep)
     stone_tint_stats.upkeep_worst_ms = math.max(stone_tint_stats.upkeep_worst_ms or 0, upkeep)
-    local strength = state.strength
-    if strength == 0 or not art then return end
     -- THE FRAME'S WORK CAP runs from here, after the upkeep above, and this
     -- frame's counts start at nothing.
     work_until = clock() + WORK_MS / 1000
@@ -2717,6 +3203,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     -- THE ART AS DRAWN: this frame's reads, and a new round of checks now and then.
     frame_reads, frame_checks = READS_PER_FRAME, CHECKS_PER_FRAME
     frame_id = frame_id + 1
+    fast.frame = frame_id
     local now = dfhack.getTickCount()
     if now - source_round_at >= SOURCE_CHECK_MS then
         source_round, source_round_at = source_round + 1, now
@@ -2738,10 +3225,12 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     enabled[G_SOIL_RAMPS] = soil and state.ramps
     enabled[G_ENGRAVED] = state.engraved
     if not (state.rough or state.smooth or state.stairs or state.ramps or state.engraved) then
+        paint_fog()
         return
     end
 
     -- Detailed Weather's look moved on: its old copies' numbers may be reused.
+    dw_memo.active = rawget(_G, 'detailed_weather_pointed_from') ~= nil
     dw_check_look()
     -- ENGRAVED FLOORS BY THE MAP: filed again if their number changed.
     engravings.refresh()
@@ -2794,10 +3283,13 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
         end
     end
 
-    -- FLOOR EDGES on this level, every cell, and only when it has floors of
-    -- ours to drop them (engraved ones count).
-    local floors_so_far = counts[K_FLOOR] + counts[K_ENGRAVED]
-    if floors_so_far > 0 then paint_edges(vp, bg, nil, dim_x * dim_y, dim_x, dim_y) end
+    if n_open > 0 then paint_fog(open, n_open) end
+
+    -- FLOOR EDGES on this level (runs whenever rough stone or soil is enabled,
+    -- so off-screen rough floors still tint lips along the screen border).
+    if state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS]) then
+        paint_edges(vp, bg, nil, dim_x * dim_y, dim_x, dim_y, win_x, win_y, z, colours)
+    end
 
     -- The levels below, one at a time, through the cells left empty above
     -- (see THE LEVELS BELOW). A cell empty again on this level goes on the
@@ -2835,10 +3327,10 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             end
         end
         -- This level's floor edges, as on the level above: every cell of it
-        -- that shows (open, the list it was walked through).
-        if counts[K_FLOOR] + counts[K_ENGRAVED] > floors_so_far then
-            paint_edges(lvp, lbg, open, n_open, dim_x, dim_y)
-            floors_so_far = counts[K_FLOOR] + counts[K_ENGRAVED]
+        -- that shows (open), including lips cast by rough floors tucked under
+        -- an overhang on the level above.
+        if state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS]) then
+            paint_edges(lvp, lbg, open, n_open, dim_x, dim_y, win_x, win_y, lz, colours)
         end
         open, next_open, n_open = next_open, open, n_next
     end
@@ -2924,8 +3416,8 @@ TintWindow = defclass(TintWindow, widgets.Window)
 TintWindow.ATTRS{
     frame_title='Stone Tint',
     -- Height is the body plus 4 (border and inset, top and bottom). The body
-    -- runs to the Close line at row 28, so 29 rows.
-    frame={w=44, h=33},
+    -- runs to the Close line at row 30, so 31 rows.
+    frame={w=44, h=35},
     resizable=false,
     autoarrange_subviews=true,
     autoarrange_gap=1,
@@ -2998,7 +3490,16 @@ function TintWindow:init()
         -- Black shadows and depth fog, whatever graphics are loaded (SHADOWS
         -- AND FOG). Independent of the tint.
         toggle('Black shadows and fog:', 'CUSTOM_B', 'black_shadows'),
-        widgets.Label{frame={t=28}, text={{key='LEAVESCREEN', text=': Close'}}},
+        widgets.CycleHotkeyLabel{
+            label='Floor edges:', key='CUSTOM_D',
+            options={{label='Smart', value='smart'}, {label='Simple', value='simple'},
+                     {label='Off', value='off'}},
+            initial_option=state.edges or 'smart',
+            on_change=function(mode)
+                state.edges = mode save_state() force_repaint()
+            end,
+        },
+        widgets.Label{frame={t=30}, text={{key='LEAVESCREEN', text=': Close'}}},
     }
 end
 
@@ -3069,8 +3570,8 @@ function stone_tint_command(...)
     elseif args[1] == 'status' then
         print(('stone-tint: overlay is %s'):format(
             overlay.isOverlayEnabled('stone-tint.map') and 'enabled' or 'disabled'))
-        print(('stone-tint: strength is %d%%, tint style %s'):format(get_state().strength,
-            get_state().style))
+        print(('stone-tint: strength is %d%%, tint style %s, %s edges'):format(get_state().strength,
+            get_state().style, get_state().edges or 'smart'))
         local art_ok, stats, hidden, tk, engraved_art, shaded = get_report()
         if not art_ok then
             print('stone-tint: art data stone-tint/art-vanilla.lua did not load; nothing is tinted')
@@ -3084,8 +3585,8 @@ function stone_tint_command(...)
         -- DF'S OWN PIECES AND OVERLAYS: what was read, and what was found.
         local function count(t) local n = 0 for _ in pairs(t) do n = n + 1 end return n end
         print(('stone-tint: DF\'s own pieces and overlays, read from %d graphics folders (%d files): '
-            .. 'stone floor pieces %d of 9, soil floor pieces %d of 9, ramp overlays %d; engraved art %s')
-            :format(tk.dirs, tk.files, count(tk.stone), count(tk.soil), count(tk.overlay),
+            .. 'stone floor pieces %d of 9, soil floor pieces %d of 9, pebbles pieces %d of 9, ramp overlays %d; engraved art %s')
+            :format(tk.dirs, tk.files, count(tk.stone), count(tk.soil), count(tk.pebbles), count(tk.overlay),
             engraved_art and 'loaded' or 'missing from stone-tint/art-vanilla.lua'))
         print(('stone-tint: textures made this session: %d, from %d pictures read off DF'):format(
             stats.textures, stats.sources or 0))
@@ -3147,6 +3648,11 @@ function stone_tint_command(...)
         set_preset(strength)
     elseif args[1] == 'style' then
         if not set_style(args[2]) then qerror('style must be one of: keep, smooth, classic') end
+    elseif args[1] == 'edges' then
+        if not edge.modes[args[2]] then qerror('edges must be one of: smart, simple, off') end
+        state.edges = args[2]
+        save_state()
+        force_repaint()
     else
         print('Use: stone-tint [gui]')
         print('     overlay enable stone-tint.map')
@@ -3155,6 +3661,7 @@ function stone_tint_command(...)
         print('     stone-tint status')
         print('     stone-tint set <' .. table.concat(STRENGTHS, '|') .. '>')
         print('     stone-tint style <keep|smooth|classic>')
+        print('     stone-tint edges <smart|simple|off>')
     end
 end
 
