@@ -466,13 +466,15 @@ end
 -- texpos is forgotten, so freed numbers are filed afresh.
 local function dw_check_look()
     local mod = dw_colour
+    if mod == nil and dw_memo.active then mod = dw_module() end
     if not mod then return end   -- not looked up or not running: nothing filed
     local ok, key = pcall(dw_shown_key, mod)
     key = ok and key or false
     if key == dw_look then return end
     dw_look = key
     known_texpos = {}
-    dw_memo = {filed = {}, live = {}}
+    dw_memo = {filed = {}, live = {}, active = dw_memo.active}
+    if edge.snap then edge.snap.valid = false end
 end
 
 -- ==========================================
@@ -2154,23 +2156,61 @@ local function paint_fog()
     if base then
         if fog_zeros.snap_cap ~= total then
             if fog_zeros.snap then df.delete(fog_zeros.snap) end
+            if fog_zeros.out then df.delete(fog_zeros.out) end
             fog_zeros.snap = df.new('int32_t', total)
+            fog_zeros.out = df.new('int32_t', total)
+            local _, oa = df.sizeof(fog_zeros.out)
+            fog_zeros.out_addr = oa
             fog_zeros.snap_cap = total
             fog_zeros.snap_ok = false
         end
-        local snap = fog_zeros.snap
+        local snap, out = fog_zeros.snap, fog_zeros.out
         if fog_zeros.snap_ok and fog_zeros.snap_sentinel == tint_sentinel
-                and fog_zeros.snap_black == black_set then
+                and fog_zeros.snap_black == black_set and fog_zeros.snap_copies == fc then
             local ok_r = true
             if fog_zeros.snap_round ~= sr then
+                local all_fresh = true
                 for t, old_c in pairs(fog_zeros.used) do
                     if fog_copy(t) ~= old_c then ok_r = false break end
+                    local c = fc[t]
+                    if not c or c.round ~= sr then all_fresh = false end
                 end
-                if ok_r and fog_reads > 0 then fog_zeros.snap_round = sr end
+                if ok_r and all_fresh then fog_zeros.snap_round = sr end
             end
-            if ok_r and not diffscan(snap, base, 0, total, 4) then
-                local fidx, ftex, fn = fog_zeros.fidx, fog_zeros.ftex, fog_zeros.fn
-                for k = 1, fn do layer[fidx[k]] = ftex[k] end
+            if ok_r then
+                local used = fog_zeros.used
+                local pos, diffs = 0, 0
+                while pos < total do
+                    local hit = diffscan(snap, base, pos, total, 4)
+                    if not hit then break end
+                    diffs = diffs + 1
+                    if diffs > 512 then ok_r = false break end
+                    local t = layer[hit]
+                    if t == 0 or black_set[t] then
+                        snap[hit] = t
+                        out[hit] = t
+                    else
+                        local c = fc[t]
+                        local copy
+                        if c and c.round == sr then copy = c.copy else copy = fog_copy(t) end
+                        if copy then
+                            snap[hit] = t
+                            out[hit] = copy
+                            used[t] = copy
+                        elseif copy == false then
+                            snap[hit] = t
+                            out[hit] = t
+                            used[t] = false
+                        else
+                            snap[hit] = -1
+                            out[hit] = t
+                        end
+                    end
+                    pos = hit + 1
+                end
+            end
+            if ok_r then
+                dfhack.internal.memmove(base, fog_zeros.out_addr, total * 4)
                 return
             end
             fog_zeros.snap_ok = false
@@ -2178,11 +2218,7 @@ local function paint_fog()
         dfhack.internal.memmove(snap, base, total * 4)
     end
 
-    local fidx = fog_zeros.fidx
-    if not fidx then fidx = {} fog_zeros.fidx = fidx end
-    local ftex = fog_zeros.ftex
-    if not ftex then ftex = {} fog_zeros.ftex = ftex end
-    local used, fn = {}, 0
+    local used = {}
     local zeros = base and fog_zeros_for(total)
     local complete = true
     local i = 0
@@ -2204,8 +2240,6 @@ local function paint_fog()
             end
             if copy then
                 layer[i] = copy
-                fn = fn + 1
-                fidx[fn], ftex[fn] = i, copy
                 used[t] = copy
             elseif copy == false then
                 used[t] = false
@@ -2215,11 +2249,12 @@ local function paint_fog()
         end
         i = i + 1
     end
-    if base and complete and fog_zeros.snap then
-        fog_zeros.fn = fn
+    if base and complete and fog_zeros.out then
+        dfhack.internal.memmove(fog_zeros.out, base, total * 4)
         fog_zeros.used = used
         fog_zeros.snap_sentinel = tint_sentinel
         fog_zeros.snap_black = black_set
+        fog_zeros.snap_copies = fc
         fog_zeros.snap_round = sr
         fog_zeros.snap_ok = true
     end
@@ -2251,14 +2286,16 @@ for _, name in ipairs({'GRASS_LIGHT', 'GRASS_DARK', 'GRASS_DRY', 'GRASS_DEAD'}) 
     local m = df.tiletype_material[name]
     if m then NEVER_MATERIALS[m] = true end
 end
-local RAMP, SMOOTH = S.RAMP, df.tiletype_special.SMOOTH
+local RAMP, SMOOTH, M_TREE = S.RAMP, df.tiletype_special.SMOOTH, df.tiletype_material.TREE
 tile_kind = function(x, y, z, flag)
     local b = fast.block(x, y, z)
     if not b then return false, false end
     local idx = (x & 15) * 16 + (y & 15)
     local material, tshape, special = tile_attrs(b.tt[idx])
     -- (a grass ramp still gets its overlay: RAMP_OTHER, below)
-    if NEVER_SHAPES[tshape] or (NEVER_MATERIALS[material] and tshape ~= RAMP) then return false, true end
+    if NEVER_SHAPES[tshape] or (NEVER_MATERIALS[material] and tshape ~= RAMP) then
+        return false, tshape == S.WALL and material ~= M_TREE
+    end
     local stair = STAIR_SHAPES[tshape]
     if not (stair or tshape == RAMP or FLOOR_LIKE[tshape]) then return false, false end
     if (b.des[idx] & fast.m_hidden) ~= 0 then return false, false end
@@ -2310,7 +2347,8 @@ end
 -- Forget every texture filed (known_texpos), and Detailed Weather's answers.
 local function reset_known()
     known_texpos = {}
-    dw_memo = {filed = {}, live = {}}
+    dw_memo = {filed = {}, live = {}, active = dw_memo.active}
+    if edge.snap then edge.snap.valid = false end
 end
 
 local function reset_cache(z)
@@ -3430,8 +3468,10 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
 
     local S = edge.snap
     if not S then
-        S = { raw = {}, ff_raw = {}, ff_ok = {}, ecells = {}, raw_cap = 0,
-              pidx = {}, ptex = {}, pn = {}, pstamp = {}, open_stamp = {}, used_src = {},
+        S = { raw = {}, out = {}, out_addr = {}, ff_raw = {}, ff_ok = {}, ecells = {},
+              raw_cap = 0, open_stamp = {}, used_src = {},
+              chg_lvl = {}, chg_hit = {}, chg_drawn = {},
+              col_dirty = {}, col_list = {},
               stamp = 0, valid = false }
         edge.snap = S
     end
@@ -3447,50 +3487,45 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             and S.ov == frame_overlays and S.faces == state.faces
             and S.gmask == gmask and S.lmask == lmask then
         local cache_ok = true
+        local by_tx = stone_tint_sources.by_texpos
         if S.round ~= source_round then
+            local all_fresh = true
             for t, old_sid in pairs(S.used_src) do
                 if source_for(t) ~= old_sid then cache_ok = false break end
+                local sc = by_tx[t]
+                if not sc or sc.round ~= source_round then all_fresh = false end
             end
-            if cache_ok and frame_checks > 0 then S.round = source_round end
+            if cache_ok and all_fresh then S.round = source_round end
         end
+
+        local chg_lvl, chg_hit, chg_drawn = S.chg_lvl, S.chg_hit, S.chg_drawn
+        local col_dirty, col_list = S.col_dirty, S.col_list
+        local chg_n, col_n = 0, 0
+        local bg_bases = {}
+
         if cache_ok then
-            local tk_checks = 0
             for lvl = 0, S.n_lower do
                 local port = (lvl == 0) and vp or lower[lvl - 1]
                 local pbg = port and port.screentexpos_background
-                local pflags = port and port.screentexpos_ramp_flag
                 local base = pbg and fog_interface_base(port, 'screentexpos_background')
                 local raw = S.raw[lvl]
                 if not pbg or not base or not raw then cache_ok = false break end
+                bg_bases[lvl] = base
                 local ostamp = (lvl > 0) and S.open_stamp[lvl] or nil
-                local pstamp = S.pstamp[lvl]
-                local lz = z - lvl
                 local pos = 0
                 while pos < total do
                     local hit = diffscan(raw, base, pos, total, 4)
                     if not hit then break end
+                    chg_n = chg_n + 1
+                    if chg_n > 512 then cache_ok = false break end
                     local drawn = pbg[hit]
-                    if ostamp and ostamp[hit] ~= S.stamp then
-                        raw[hit] = drawn
-                    else
-                        local old = raw[hit]
-                        if old ~= 0 and drawn ~= 0 and known[old] == false and known[drawn] == false then
-                            raw[hit] = drawn
-                        elseif old ~= 0 and drawn ~= 0 and not (pstamp and pstamp[hit] == S.stamp) then
-                            tk_checks = tk_checks + 1
-                            if tk_checks > 256 then cache_ok = false break end
-                            local sx = hit // dim_y
-                            local wx, wy = win_x + sx, win_y + hit - sx * dim_y
-                            if wx < 0 or wx >= max_x or wy < 0 or wy >= max_y
-                                    or not tile_kind(wx, wy, lz, pflags and pflags[hit]) then
-                                raw[hit] = drawn
-                            else
-                                cache_ok = false
-                                break
-                            end
-                        else
-                            cache_ok = false
-                            break
+                    chg_lvl[chg_n], chg_hit[chg_n], chg_drawn[chg_n] = lvl, hit, drawn
+                    if (not ostamp or ostamp[hit] == S.stamp) and (raw[hit] == 0 or drawn == 0) then
+                        if not col_dirty[hit] then
+                            col_n = col_n + 1
+                            if col_n > 64 then cache_ok = false break end
+                            col_dirty[hit] = true
+                            col_list[col_n] = hit
                         end
                     end
                     pos = hit + 1
@@ -3499,30 +3534,131 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             end
         end
 
+        if cache_ok and col_n > 0 then
+            local has_deeper = S.n_lower < LOWER_LEVELS and (z - S.n_lower - 1) >= 0
+                and lower and lower[S.n_lower] and lower[S.n_lower].flag.active
+                and lower[S.n_lower].dim_x == dim_x and lower[S.n_lower].dim_y == dim_y
+            if has_deeper then
+                for c = 1, col_n do
+                    local hit = col_list[c]
+                    local all_zero = true
+                    for lvl = 0, S.n_lower do
+                        local port = (lvl == 0) and vp or lower[lvl - 1]
+                        if port.screentexpos_background[hit] ~= 0 then all_zero = false break end
+                    end
+                    if all_zero then cache_ok = false break end
+                end
+            end
+        end
+
         if cache_ok then
+            local used_src = S.used_src
+            for k = 1, chg_n do
+                local hit = chg_hit[k]
+                if not col_dirty[hit] then
+                    local lvl, drawn = chg_lvl[k], chg_drawn[k]
+                    local ostamp = (lvl > 0) and S.open_stamp[lvl] or nil
+                    local raw, out = S.raw[lvl], S.out[lvl]
+                    if ostamp and ostamp[hit] ~= S.stamp then
+                        raw[hit] = drawn
+                        out[hit] = drawn
+                    else
+                        local after = drawn
+                        if drawn ~= 0 and known[drawn] ~= false then
+                            local sx = hit // dim_y
+                            local wx, wy = win_x + sx, win_y + hit - sx * dim_y
+                            if wx >= 0 and wx < max_x and wy >= 0 and wy < max_y then
+                                local port = (lvl == 0) and vp or lower[lvl - 1]
+                                local pbg = port.screentexpos_background
+                                local lcol, lchk = level_caches(z - lvl)
+                                paint_cell(pbg, port.screentexpos_ramp_flag, hit, drawn, wx, wy, z - lvl, lcol, lchk)
+                                after = pbg[hit]
+                            end
+                        end
+                        if after ~= out[hit] then S.ff_ok[lvl] = false end
+                        raw[hit] = drawn
+                        out[hit] = after
+                        if after ~= drawn then
+                            local sc = by_tx[drawn]
+                            if sc and sc.id then used_src[drawn] = sc.id end
+                        end
+                    end
+                end
+            end
+
+            for c = 1, col_n do
+                local hit = col_list[c]
+                col_dirty[hit] = nil
+                local sx = hit // dim_y
+                local wx, wy = win_x + sx, win_y + hit - sx * dim_y
+                local in_bounds = wx >= 0 and wx < max_x and wy >= 0 and wy < max_y
+                local still_open = true
+                for lvl = 0, S.n_lower do
+                    local port = (lvl == 0) and vp or lower[lvl - 1]
+                    local pbg = port.screentexpos_background
+                    local drawn = pbg[hit]
+                    local raw, out = S.raw[lvl], S.out[lvl]
+                    local ostamp = (lvl > 0) and S.open_stamp[lvl] or nil
+                    if still_open then
+                        if ostamp and ostamp[hit] ~= S.stamp then ostamp[hit] = S.stamp S.ff_ok[lvl] = false end
+                        if drawn == 0 then
+                            if out[hit] ~= 0 then S.ff_ok[lvl] = false end
+                            raw[hit], out[hit] = 0, 0
+                        else
+                            local after = drawn
+                            if in_bounds and known[drawn] ~= false then
+                                local lcol, lchk = level_caches(z - lvl)
+                                paint_cell(pbg, port.screentexpos_ramp_flag, hit, drawn, wx, wy, z - lvl, lcol, lchk)
+                                after = pbg[hit]
+                            end
+                            if after ~= out[hit] then S.ff_ok[lvl] = false end
+                            raw[hit], out[hit] = drawn, after
+                            if after ~= drawn then
+                                local sc = by_tx[drawn]
+                                if sc and sc.id then used_src[drawn] = sc.id end
+                            end
+                            still_open = false
+                        end
+                    else
+                        if ostamp and ostamp[hit] == S.stamp then ostamp[hit] = 0 S.ff_ok[lvl] = false end
+                        if out[hit] ~= drawn then S.ff_ok[lvl] = false end
+                        raw[hit], out[hit] = drawn, drawn
+                    end
+                end
+            end
+
             local function replay_edges(lvl, port, pbg, lz, lcol, ostamp)
-                local ff_base = S.ff_ok[lvl] and fog_interface_base(port, 'screentexpos_floor_flag')
-                if ff_base and not diffscan(S.ff_raw[lvl], ff_base, 0, total * 2, 4) then
+                local ff_base = fog_interface_base(port, 'screentexpos_floor_flag')
+                if S.ff_ok[lvl] and ff_base and not diffscan(S.ff_raw[lvl], ff_base, 0, total * 2, 4) then
                     local ec = S.ecells[lvl]
                     if ec and ec.n > 0 then
                         paint_edges(port, pbg, ec, ec.n, dim_x, dim_y, win_x, win_y, lz, lcol)
                     end
-                elseif lvl == 0 then
-                    paint_edges(port, pbg, nil, total, dim_x, dim_y, win_x, win_y, lz, lcol)
+                    return
+                end
+                local ec = nil
+                if ff_base then
+                    dfhack.internal.memmove(S.ff_raw[lvl], ff_base, total * 8)
+                    ec = S.ecells[lvl]
+                    if not ec then ec = { n = 0 } S.ecells[lvl] = ec else ec.n = 0 end
+                    S.ff_ok[lvl] = true
                 else
-                    paint_edges(port, pbg, true, 1, dim_x, dim_y, win_x, win_y, lz, lcol, ostamp, S.stamp)
+                    S.ff_ok[lvl] = false
+                end
+                if lvl == 0 then
+                    paint_edges(port, pbg, nil, total, dim_x, dim_y, win_x, win_y, lz, lcol, nil, nil, ec)
+                else
+                    paint_edges(port, pbg, true, 1, dim_x, dim_y, win_x, win_y, lz, lcol, ostamp, S.stamp, ec)
                 end
             end
 
-            local pidx, ptex, pn = S.pidx[0], S.ptex[0], S.pn[0]
-            for k = 1, pn do bg[pidx[k]] = ptex[k] end
+            dfhack.internal.memmove(bg_bases[0], S.out_addr[0], total * 4)
             paint_fog()
             if edges_on then replay_edges(0, vp, bg, z, colours, nil) end
             for lvl = 1, S.n_lower do
                 local lvp = lower[lvl - 1]
                 local lbg = lvp.screentexpos_background
-                pidx, ptex, pn = S.pidx[lvl], S.ptex[lvl], S.pn[lvl]
-                for k = 1, pn do lbg[pidx[k]] = ptex[k] end
+                dfhack.internal.memmove(bg_bases[lvl], S.out_addr[lvl], total * 4)
                 if edges_on then
                     local lz = z - lvl
                     replay_edges(lvl, lvp, lbg, lz, level_caches(lz), S.open_stamp[lvl])
@@ -3532,22 +3668,29 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             below = S.below
             ramp.laid = S.laid
             replayed = true
+        else
+            for c = 1, col_n do col_dirty[col_list[c]] = nil end
         end
     end
 
     if not replayed then
         local cap_snap = false
+        local bg_base = nil
         if diffscan then
             if S.raw_cap < total then
                 for lvl = 0, LOWER_LEVELS do
                     if S.raw[lvl] then df.delete(S.raw[lvl]) end
+                    if S.out[lvl] then df.delete(S.out[lvl]) end
                     if S.ff_raw[lvl] then df.delete(S.ff_raw[lvl]) end
                     S.raw[lvl] = df.new('int32_t', total)
+                    S.out[lvl] = df.new('int32_t', total)
                     S.ff_raw[lvl] = df.new('int32_t', total * 2)
+                    local _, oa = df.sizeof(S.out[lvl])
+                    S.out_addr[lvl] = oa
                 end
                 S.raw_cap = total
             end
-            local bg_base = fog_interface_base(vp, 'screentexpos_background')
+            bg_base = fog_interface_base(vp, 'screentexpos_background')
             if bg_base then
                 dfhack.internal.memmove(S.raw[0], bg_base, total * 4)
                 S.stamp = S.stamp + 1
@@ -3557,13 +3700,6 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
         end
         local used_src = S.used_src
         local by_tx = stone_tint_sources.by_texpos
-        local pidx0 = S.pidx[0]
-        if not pidx0 then pidx0 = {} S.pidx[0] = pidx0 end
-        local ptex0 = S.ptex[0]
-        if not ptex0 then ptex0 = {} S.ptex[0] = ptex0 end
-        local pstamp0 = S.pstamp[0]
-        if not pstamp0 then pstamp0 = {} S.pstamp[0] = pstamp0 end
-        local pn0 = 0
 
         local open, n_open = see_through, 0
         local index = 0
@@ -3583,15 +3719,9 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                             local kind = paint_cell(bg, ramp_flags, index, drawn, wx, wy, z,
                                 colours, checks)
                             if kind then counts[kind] = counts[kind] + 1 end
-                            if cap_snap then
-                                local after = bg[index]
-                                if after ~= drawn then
-                                    pn0 = pn0 + 1
-                                    pidx0[pn0], ptex0[pn0] = index, after
-                                    pstamp0[index] = S.stamp
-                                    local sc = by_tx[drawn]
-                                    if sc and sc.id then used_src[drawn] = sc.id end
-                                end
+                            if cap_snap and bg[index] ~= drawn then
+                                local sc = by_tx[drawn]
+                                if sc and sc.id then used_src[drawn] = sc.id end
                             end
                         end
                     end
@@ -3599,7 +3729,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                 end
             end
         end
-        S.pn[0] = pn0
+        if cap_snap then dfhack.internal.memmove(S.out[0], bg_base, total * 4) end
 
         paint_fog()
 
@@ -3629,20 +3759,13 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             if not lbg or not lflags then break end
             local lvl = i + 1
             n_lower = lvl
-            local ostamp, pstampL = nil, nil
-            local pidxL, ptexL, pnL = nil, nil, 0
+            local ostamp, lbase = nil, nil
             if cap_snap then
-                local lbase = fog_interface_base(lvp, 'screentexpos_background')
+                lbase = fog_interface_base(lvp, 'screentexpos_background')
                 if lbase then
                     dfhack.internal.memmove(S.raw[lvl], lbase, total * 4)
                     ostamp = S.open_stamp[lvl]
                     if not ostamp then ostamp = {} S.open_stamp[lvl] = ostamp end
-                    pidxL = S.pidx[lvl]
-                    if not pidxL then pidxL = {} S.pidx[lvl] = pidxL end
-                    ptexL = S.ptex[lvl]
-                    if not ptexL then ptexL = {} S.ptex[lvl] = ptexL end
-                    pstampL = S.pstamp[lvl]
-                    if not pstampL then pstampL = {} S.pstamp[lvl] = pstampL end
                 else
                     cap_snap = false
                 end
@@ -3667,20 +3790,14 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                             counts[kind] = counts[kind] + 1
                             below = below + 1
                         end
-                        if cap_snap then
-                            local after = lbg[cell]
-                            if after ~= drawn then
-                                pnL = pnL + 1
-                                pidxL[pnL], ptexL[pnL] = cell, after
-                                pstampL[cell] = S.stamp
-                                local sc = by_tx[drawn]
-                                if sc and sc.id then used_src[drawn] = sc.id end
-                            end
+                        if cap_snap and lbg[cell] ~= drawn then
+                            local sc = by_tx[drawn]
+                            if sc and sc.id then used_src[drawn] = sc.id end
                         end
                     end
                 end
             end
-            S.pn[lvl] = pnL
+            if cap_snap then dfhack.internal.memmove(S.out[lvl], lbase, total * 4) end
             S.ff_ok[lvl] = false
             if edges_on then
                 local ecL = nil
