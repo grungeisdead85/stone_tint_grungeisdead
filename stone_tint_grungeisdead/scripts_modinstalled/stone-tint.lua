@@ -44,7 +44,12 @@ local CELL_PX = 32
 -- texture per kind of tile it covers; a z-level full of new materials would
 -- otherwise make them all in one frame and stall it. A tile waiting its turn
 -- keeps DF's own picture for a frame or two.
-local NEW_TEXTURES_PER_FRAME = 32
+-- (1.3.6) 12 again, from the 32 of 1.3.0. Every overlay draws on the game's
+-- own thread (THE QUICK FRAMES), so time spent here is game time lost. At 32 a
+-- backlog (a new level, a pan onto new stone, every change of Detailed
+-- Weather's look) ran at the whole WORK_MS a frame until it was done; at 12
+-- the count stops it sooner and the backlog takes a few frames more.
+local NEW_TEXTURES_PER_FRAME = 12
 
 -- ==========================================
 -- THE ART
@@ -227,8 +232,13 @@ local RAMP_OTHER = -3
 --
 -- On the probe's screen the main viewport held a background in 917 of its 920
 -- cells and lower_viewport[0] held one in exactly the other 3. So the loop
--- walks down only through cells the level above left empty, and stops at the
--- first level where none are left, which on most screens is the first.
+-- walked down only through cells the level above left empty, and stopped at
+-- the first level where none were left, which on most screens is the first.
+-- (1.3.5) Each level below is now scanned whole instead, every cell DF drew
+-- there (diffscan skips the empty ones in C): DF also shows the levels below
+-- under a tree's branches and leaves (Detailed Weather's 15P probe), and those
+-- cells are not empty on the level above. Since DF fills a level below only
+-- where it shows, that costs about what the walk did.
 local LOWER_LEVELS = 8
 
 -- ==========================================
@@ -331,9 +341,22 @@ end
 -- Scratch tables reused every frame so the render loop allocates nothing.
 local group_enabled = {}
 local frame_counts = {0, 0, 0, 0}
--- Cell indices the level above left empty, for the next level down. Two lists
--- that swap roles level by level; only the first n entries of each are live.
-local see_through, see_next = {}, {}
+-- THE QUICK FRAMES (1.3.6): what a full frame wrote down, kept for the quick
+-- frames after it, and their counts for `stone-tint status`. One table, as
+-- this_frame is below. See the section of that name above onRenderFrame.
+--   on        quick frames allowed (`stone-tint replay on|off`, this session)
+--   levels    [0 the level you are on, 1 to LOWER_LEVELS below] = what was
+--             written down for that level (level_of)
+--   key       what the last full frame rested on (keep_key, why_full)
+--   fx        this frame's view, for the functions below (set each frame)
+--   fog       THE FOG KEPT
+--   why       [reason] = full frames it has called since the last status
+-- (A console command is answered by the copy already running, A COMMAND
+-- WHILE THE OVERLAY IS RUNNING, so all of this lasts the session.)
+local rp = {on = true, levels = {}, key = {valid = false}, fx = {}, why = {},
+            quick_n = 0, full_n = 0, quick_ms = nil, full_ms = nil,
+            edges_kept = 0, edges_redone = 0,
+            fog = {valid = false, cap = 0, kept = 0, walked = 0, skipped = 0}}
 
 -- ==========================================
 -- TIMING AND THE FRAME'S WORK CAP
@@ -361,6 +384,13 @@ local this_frame = {
     reads = 0, read_s = 0,         -- pictures read whole
     made = 0, made_s = 0,          -- textures made
     waited = 0,                    -- tiles left for a later frame by the cap
+    -- (1.3.6, THE QUICK FRAMES) pend: set by paint_cell when it left a tile for
+    -- a later frame (no time left, a picture not read yet, a texture not made
+    -- yet), so the tile stays on the quick frames' list and is tried again;
+    -- checks_put_off: picture checks put off for want of this frame's checks,
+    -- so another full frame follows until the round of checks is through.
+    pend = false,
+    checks_put_off = 0,
 }
 
 -- ==========================================
@@ -642,8 +672,18 @@ local function tile_attrs(tt)
     return info[1], info[2], info[3]
 end
 
--- How the checks on the fast lookups stand, plus per-frame block cache
--- (memmove of tiletype and designation) and geolayer sand cache.
+-- How the checks on the fast lookups stand, plus the per-frame block cache
+-- and the geolayer sand cache.
+-- (1.3.6) READ ON DEMAND: a block's tiletypes and designations are read
+-- straight from the block as each tile is asked for, through a uint16 and a
+-- uint32 view of its two 16x16 arrays (index x * 16 + y, the order DF keeps
+-- them in, as the copies were made). In 1.3.5 every block touched was copied
+-- whole, all 256 of each, value by value through DFHack into two new Lua
+-- tables, and the copies were thrown away every frame: panning one column
+-- touched about 8 blocks, some 4,000 reads and 24 new tables a frame for the
+-- hundred-odd tiles asked about. A view reads the block as it is (a tile dug
+-- shows at once); the views are still made afresh each frame (fast.frame), as
+-- the copies were, so none is kept past the frame its block was found in.
 local fast = {on=true, calls=0, checked=0, note=nil, full_n=0, full_s=0, kinds={},
               layer_sand={}, blocks={}, frame=0, blocks_frame=-1}
 
@@ -673,8 +713,6 @@ function fast.init_bits()
     fast.s_geo, fast.m_geo = int_bits('geolayer_index', nil, nil)
     fast.s_bio, fast.m_bio = int_bits('biome', nil, nil)
     df.delete(raw)
-    fast.tt_buf = df.new('uint16_t', 256)
-    fast.des_buf = df.new('uint32_t', 256)
 end
 
 function fast.block(x, y, z)
@@ -690,14 +728,11 @@ function fast.block(x, y, z)
     local block = dfhack.maps.getTileBlock(x, y, z)
     if not block then blocks[key] = false return nil end
     if not fast.des_init then fast.init_bits() end
+    -- READ ON DEMAND: b.tt[i] and b.des[i] read the block's own arrays.
     local _, tat = df.sizeof(block:_field('tiletype'))
-    dfhack.internal.memmove(fast.tt_buf, tat, 512)
     local _, dat = df.sizeof(block:_field('designation'))
-    dfhack.internal.memmove(fast.des_buf, dat, 1024)
-    local tt, des = {}, {}
-    local tbuf, dbuf = fast.tt_buf, fast.des_buf
-    for i = 0, 255 do tt[i], des[i] = tbuf[i], dbuf[i] end
-    b = {tt = tt, des = des, rgn = {}}
+    b = {tt = df.reinterpret_cast('uint16_t', tat), des = df.reinterpret_cast('uint32_t', dat),
+         rgn = {}}
     blocks[key] = b
     return b
 end
@@ -1248,6 +1283,8 @@ local function source_for(texpos)
     if s then
         if frame_checks <= 0 then
             waiting[texpos] = frame_id
+            -- (THE QUICK FRAMES) a check put off: this round isn't through yet
+            this_frame.checks_put_off = this_frame.checks_put_off + 1
             return s.id
         end
         frame_checks = frame_checks - 1
@@ -1650,6 +1687,8 @@ refresh_tokens = function(force)
     -- new ones (update_ramp_overlays); the pieces and overlays drawn from the old go
     tokens.rehide = true
     edge.made, ramp.made = {}, {}
+    -- (THE QUICK FRAMES) the pieces and overlays moved: a full frame follows
+    tokens.gen = (tokens.gen or 0) + 1
     return true
 end
 end
@@ -2075,7 +2114,10 @@ end
 -- alpha, as the first level's are (SHADOWS AND FOG).
 local FOG_RGB = {89, 146, 172}
 local FOG_TOLERANCE = 8
-local FOG_READS_PER_FRAME = 24
+-- (1.3.6) 4 again, from the 24 of 1.3.4. These reads are made in paint_fog,
+-- before THE FRAME'S WORK CAP starts, so only this count bounds them: each new
+-- texture in the fog layer is a 1024-pixel read and usually a texture made.
+local FOG_READS_PER_FRAME = 4
 local fog_copies = {}             -- texpos -> {copy=texpos or false, addr=, sig=, round=}
 local fog_reads = 0
 
@@ -2114,7 +2156,12 @@ local function fog_copy(t)
     local c = fog_copies[t]
     if c and c.round == source_round then return c.copy end
     -- As source_for: nothing read off a texture without a read to spend.
-    if fog_reads <= 0 then return c and c.copy or nil end
+    -- (THE FOG KEPT) a copy used unchecked this round is counted, so the
+    -- layer is walked again next frame until the round is through.
+    if fog_reads <= 0 then
+        if c then rp.fog.skipped = rp.fog.skipped + 1 end
+        return c and c.copy or nil
+    end
     local px, pitch, addr = surface(t)
     if not px then
         fog_copies[t] = {copy=false, round=source_round}
@@ -2158,20 +2205,86 @@ function scan.base(vp, field)
 end
 
 -- Each frame: the fog layer of the levels below, made black.
+--
+-- THE FOG KEPT (1.3.6). This layer holds DF's own drawing of the levels'
+-- haze, and nothing changes it between frames while the view stands still
+-- (Detailed Weather draws its weather fog in the main view's layer, not this
+-- one). So once a frame has given every cell its black copy, the layer as DF
+-- drew it (raw) and as it was left (out) are kept, and the next frame
+-- compares DF's new drawing with raw in C (diffscan), works out only the cells
+-- that differ, and writes the whole layer back in one move (memmove). The
+-- walk of every cell, 1.6 to 1.7 ms a frame on an 8,000-cell view in play
+-- (`stone-tint status`, 2026-11-26), comes back only when something it rests
+-- on moved: DF's textures (the sentinel), the black copies (black_set), the
+-- copies kept (fog_copies), a round of checks (source_round), the view's size,
+-- or more than FOG_DIFF_MOST cells differing at once. A cell whose copy waits
+-- for a read is kept as -1 in raw, which DF never draws, so it differs next
+-- frame and is tried again. Until 1.3.6 a frame whose copies had all come
+-- after one that waited also made DF redraw the whole screen
+-- (force_full_display_count); DF's own comparison of each cell already
+-- redraws a cell whose value changed, so that is gone.
+local FOG_DIFF_MOST = 256
+
 local function paint_fog()
-    if not state.black_shadows or not stone_tint_shades.applied then return end
+    local F = rp.fog
+    if not state.black_shadows or not stone_tint_shades.applied then F.valid = false return end
     local lvp = df.global.gps.lower_viewport[0]
-    if not lvp or not lvp.flag.active then return end
+    if not lvp or not lvp.flag.active then F.valid = false return end
     local total = lvp.dim_x * lvp.dim_y
-    if total <= 0 then return end
+    if total <= 0 then F.valid = false return end
     fog_reads = FOG_READS_PER_FRAME
     local layer = lvp.screentexpos_interface
     local black_set = stone_tint_shades.black_set
     local fc, sr = fog_copies, source_round
-    local diffscan = dfhack.internal.diffscan
+    local diffscan, memmove = dfhack.internal.diffscan, dfhack.internal.memmove
     local base = diffscan and scan.base(lvp, 'screentexpos_interface') or nil
+    -- What a cell showing DF's texture t is given (its black copy, or t itself:
+    -- empty, already black, not fog, or no copy yet) and whether its copy
+    -- waits for a read.
+    local function give(t)
+        if t == 0 or (black_set and black_set[t]) then return t, false end
+        local c = fc[t]
+        local copy
+        if c and c.round == sr then copy = c.copy else copy = fog_copy(t) end
+        if copy then return copy, false end
+        return t, copy == nil
+    end
+    local keep = base ~= nil and memmove ~= nil and rp.on
+    if keep and F.cap ~= total then
+        if F.raw then df.delete(F.raw) df.delete(F.out) end
+        F.raw, F.out = df.new('int32_t', total), df.new('int32_t', total)
+        local _, ra = df.sizeof(F.raw)
+        local _, oa = df.sizeof(F.out)
+        F.raw_addr, F.out_addr, F.cap, F.valid = ra, oa, total, false
+    end
+    if keep and F.valid and F.sentinel == tint_sentinel and F.black == black_set
+            and F.copies == fc and F.round == sr then
+        local raw, out = F.raw, F.out
+        local pos, n, skipped0 = 0, 0, F.skipped
+        while pos < total do
+            local hit = diffscan(raw, base, pos, total, 4)
+            if not hit then break end
+            n = n + 1
+            if n > FOG_DIFF_MOST then break end
+            local t = layer[hit]
+            local o, waits = give(t)
+            raw[hit] = waits and -1 or t
+            out[hit] = o
+            pos = hit + 1
+        end
+        if n <= FOG_DIFF_MOST then
+            memmove(base, F.out_addr, total * 4)
+            -- (a copy given unchecked this round: the next frame walks whole)
+            if F.skipped ~= skipped0 then F.valid = false end
+            F.kept = F.kept + 1
+            return
+        end
+    end
+    -- THE WHOLE WALK: DF's drawing kept first (raw), every cell given its copy,
+    -- then the layer as left (out).
+    F.skipped = 0
+    if keep then memmove(F.raw_addr, base, total * 4) end
     local zeros = base and scan.zeros(total) or nil
-    local deferred = false
     local i = 0
     while i < total do
         local t = layer[i]
@@ -2185,27 +2298,20 @@ local function paint_fog()
                 t = nil
             end
         end
-        if t and (not black_set or not black_set[t]) then
-            local c = fc[t]
-            local copy
-            if c and c.round == sr then
-                copy = c.copy
-            else
-                copy = fog_copy(t)
-            end
-            if copy then
-                layer[i] = copy
-            elseif copy == nil then
-                deferred = true
-            end
+        if t then
+            local o, waits = give(t)
+            if o ~= t then layer[i] = o end
+            if waits and keep then F.raw[i] = -1 end
         end
         i = i + 1
     end
-    if deferred then
-        stone_tint_shades.fog_pending = true
-    elseif stone_tint_shades.fog_pending then
-        stone_tint_shades.fog_pending = false
-        df.global.gps.force_full_display_count = 1
+    F.walked = F.walked + 1
+    if keep then
+        memmove(F.out_addr, base, total * 4)
+        -- Kept for the next frames only once every copy on screen has been
+        -- checked this round (F.skipped counts those used unchecked).
+        F.valid = F.skipped == 0
+        F.sentinel, F.black, F.copies, F.round = tint_sentinel, black_set, fc, sr
     end
 end
 
@@ -2534,14 +2640,23 @@ end
 -- while either picture waits for a read or cannot be read.
 function ramp.plain(bg, flags, index, drawn)
     if not frame_overlays then return nil end
+    -- (THE QUICK FRAMES: this_frame.pend wherever nil means "not yet")
     local ov = ramp.overlay(flags[index])
-    if not ov then return nil end
+    if not ov then
+        if ov == nil then this_frame.pend = true end
+        return nil
+    end
     local sid = source_for(drawn)
-    if not sid then return nil end
+    if not sid then
+        if sid == nil then this_frame.pend = true end
+        return nil
+    end
     local t = ramp.texpos(sid, ov, nil)
     if t then
         bg[index] = t
         ramp.laid = ramp.laid + 1
+    elseif t == nil then
+        this_frame.pend = true
     end
     return nil
 end
@@ -2573,7 +2688,7 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     if not ccol then ccol = {} checks[wx] = ccol end
     local check = ccol[wy]
     if not check or check.texpos ~= key then
-        if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
+        if not can_work() then this_frame.waited = this_frame.waited + 1 this_frame.pend = true return nil end
         local t0 = clock()
         local id, never = tile_kind(wx, wy, z, flags[index])
         check = {texpos=key, id=id, never=never}
@@ -2596,7 +2711,7 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     if not col then col = {} colours[wx] = col end
     local code = col[wy]
     if not code then
-        if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
+        if not can_work() then this_frame.waited = this_frame.waited + 1 this_frame.pend = true return nil end
         local t0 = clock()
         code = lookup_colour(wx, wy, z)
         col[wy] = code
@@ -2612,7 +2727,7 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     local src = drawn
     if original then
         if check.under == nil then
-            if not can_work() then this_frame.waited = this_frame.waited + 1 return nil end
+            if not can_work() then this_frame.waited = this_frame.waited + 1 this_frame.pend = true return nil end
             local t0 = clock()
             check.under = is_subterranean(wx, wy, z)
             this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
@@ -2620,13 +2735,13 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
         if check.under then src = original end
     end
     local sid = source_for(src)
-    if sid == nil then return nil end   -- not read yet: DF's own picture this frame
+    if sid == nil then this_frame.pend = true return nil end   -- not read yet: DF's own picture this frame
     if engraved then
         -- Engraving faces off, and DF's picture vanilla's engraving: our copy
         -- without the face. Any other engraving as drawn.
         if not state.faces then
             local vanilla = engravings.vanilla(original or drawn)
-            if vanilla == nil then return nil end
+            if vanilla == nil then this_frame.pend = true return nil end
             if vanilla then sid = -ENGRAVED_PLAIN end
         end
         if not sid then sid = state.faces and -ENGRAVED_FACE or -ENGRAVED_PLAIN end
@@ -2640,7 +2755,10 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
         local ov = ramp.overlay(flags[index])
         if ov then
             texpos = ramp.texpos(sid, ov, code)
-            if texpos then ramp.laid = ramp.laid + 1 end
+            if texpos then ramp.laid = ramp.laid + 1
+            elseif texpos == nil then this_frame.pend = true end   -- (the laid copy waits)
+        elseif ov == nil then
+            this_frame.pend = true                                 -- (its overlay not read yet)
         end
     end
     if not texpos then
@@ -2658,7 +2776,10 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
             end
         end
     end
-    if not texpos then return nil end
+    if not texpos then
+        if texpos == nil then this_frame.pend = true end   -- (nil: not this frame; false: nothing to draw)
+        return nil
+    end
     bg[index] = texpos
     return kind
 end
@@ -2759,6 +2880,7 @@ local stored_mean, stored_opaque = {}, {}
 local function resolve_edge_pieces()
     resolved_frame = frame_id
     local dw_on = dw_memo.active
+    local pending = false
     for _, id in ipairs({9, 8, 2}) do
         local e = EDGINGS[id]
         local tk, base = tokens[e[1]], e[2]
@@ -2767,9 +2889,11 @@ local function resolve_edge_pieces()
             local t = tk[p]
             if t then
                 local sid = source_for(dw_on and dw_shown(t) or t)
+                if sid == nil then pending = true end
                 ss[p] = sid == nil and nil or (sid or -(base + p - 1))
                 if dw_on then
                     local usid = source_for(t)
+                    if usid == nil then pending = true end
                     us[p] = usid == nil and nil or (usid or -(base + p - 1))
                 else
                     us[p] = ss[p]
@@ -2781,6 +2905,9 @@ local function resolve_edge_pieces()
         surf_fsid[id] = tk[5] and ss[5] or -(base + 4)
         under_fsid[id] = tk[5] and us[5] or -(base + 4)
     end
+    -- (THE QUICK FRAMES) a piece whose picture still waits for its read: the
+    -- edges drawn this frame are not whole, so they are not kept (paint_edges)
+    edge.pend_pieces = pending
 end
 
 local function source_mean(sid)
@@ -3113,7 +3240,15 @@ end
 -- floor_flag so DF draws everything in its native order.
 -- simple: writes tinted edges into bg2 over whatever DF draws.
 -- off: leaves all floor edges to DF.
-paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours)
+-- rec (1.3.6, THE QUICK FRAMES), when given: every cell given anything is
+-- written down, so the quick frames can lay the same edges again without the
+-- walk: what was written there (ff, bg2, bg; false where nothing was) and
+-- what the result rests on (held: DF's background_two there; sp: DF's
+-- spatter there; fi: the floor info of the picture under it, or false).
+-- rec.ok is false when anything was left for a later frame (a tile's shape or
+-- material by THE FRAME'S WORK CAP, a piece's or a spatter's picture not read
+-- yet, a stack's texture not made yet), so the record isn't whole.
+paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours, rec)
     if state.edges == 'off' then return end
     local ff, bg2 = port.screentexpos_floor_flag, port.screentexpos_background_two
     if not ff or not bg2 then return end
@@ -3128,6 +3263,12 @@ paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours)
     local info, ours = edge.info, edge.ours
     local flag_ok = edge.flag_ok
     if not flag_ok then flag_ok = {} edge.flag_ok = flag_ok end
+    local rn, count0, waited0 = 0, edge.count, this_frame.waited
+    local pend = 0   -- cells whose stack or spatter picture waits for a later frame
+    local rc, rff, rb2, rbg, rheld, rsp, rfi
+    if rec then
+        rc, rff, rb2, rbg, rheld, rsp, rfi = rec.cell, rec.ff, rec.bg2, rec.bg, rec.held, rec.sp, rec.fi
+    end
     local cell = 0
     while cell < total do
         local flag = ff[cell]
@@ -3156,25 +3297,34 @@ paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours)
                 local b1 = (flag >> 8) & 0xFF
                 local b2 = (flag >> 16) & 0xFF
                 local b3 = (flag >> 24) & 0xFF
-                local held = bg2[cell]
+                local held_in = bg2[cell]
+                local held = held_in
                 local stale = held ~= 0 and ours[held]
                 if stale then
                     stone_tint_stats.edges_kept = (stone_tint_stats.edges_kept or 0) + 1
                     held = 0
                 end
                 local wrote_bg2 = false
+                local ffw, bg2w, bgw = false, false, false
                 local sx = cell // dim_y
                 local np, clear = cell_pieces(b0, b1, b2, b3, sx, cell - sx * dim_y, bg,
                     dim_x, dim_y, info, win_x, win_y, z, colours)
+                -- (read whenever a pieces stack came, or the cell is to be written down)
+                local sp, floor_info = 0, nil
+                if smart and (np or rec) then
+                    sp = spatter and spatter[cell] or 0
+                    floor_info = info[bg[cell]]
+                end
                 if np then
-                    local sp = smart and spatter and spatter[cell] or 0
-                    local floor_info = smart and info[bg[cell]] or nil
                     local rem_edges = ((flag & ~clear) & 0xFFFFFFFF) ~= 0
                     if floor_info and (rem_edges or sp ~= 0) then
                         local texpos = stack_texpos(np, floor_info, nil)
+                        if texpos == nil then pend = pend + 1 end
                         if texpos then
-                            ff[cell] = flag & ~clear
+                            ffw = flag & ~clear
+                            ff[cell] = ffw
                             bg[cell] = texpos
+                            bgw = texpos
                             info[texpos] = floor_info
                             edge.count = edge.count + 1
                         end
@@ -3182,23 +3332,47 @@ paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours)
                         local sp_sid
                         if smart and sp ~= 0 then
                             sp_sid = source_for(sp)
+                            if sp_sid == nil then pend = pend + 1 end
                             if not sp_sid then np = nil end
                         end
                         if np then
                             local texpos = stack_texpos(np, nil, sp_sid)
+                            if texpos == nil then pend = pend + 1 end
                             if texpos then
-                                if smart then ff[cell] = flag & ~clear end
+                                if smart then
+                                    ffw = flag & ~clear
+                                    ff[cell] = ffw
+                                end
                                 bg2[cell] = texpos
+                                bg2w = texpos
                                 wrote_bg2 = true
                                 edge.count = edge.count + 1
                             end
                         end
                     end
                 end
-                if stale and not wrote_bg2 then bg2[cell] = 0 end
+                if stale and not wrote_bg2 then
+                    bg2[cell] = 0
+                    bg2w = 0
+                end
+                if rec and (ffw or bg2w or bgw) then
+                    rn = rn + 1
+                    rc[rn], rff[rn], rb2[rn], rbg[rn] = cell, ffw, bg2w, bgw
+                    rheld[rn], rsp[rn], rfi[rn] = held_in, sp, floor_info or false
+                end
             end
         end
         cell = cell + 1
+    end
+    if rec then
+        for k = rn + 1, rec.n do
+            rc[k], rff[k], rb2[k], rbg[k], rheld[k], rsp[k], rfi[k] = nil, nil, nil, nil, nil, nil, nil
+        end
+        rec.n, rec.count = rn, edge.count - count0
+        -- (edge.pend_pieces speaks for this frame only when the pieces were
+        -- resolved this frame: a level without edges never asks for them)
+        rec.ok = this_frame.waited == waited0 and pend == 0
+            and not (resolved_frame == frame_id and edge.pend_pieces)
     end
 end
 end)()
@@ -3210,6 +3384,8 @@ end)()
 --
 --   * The scan cannot be skipped on quiet frames. There is no persistent state
 --     to keep dirty -- skip a frame and DF's untinted floor is what shows.
+--     (1.3.6) Every tile of ours is still written every frame, but a quick
+--     frame writes them from a list instead of scanning (THE QUICK FRAMES).
 --   * Nothing needs restoring. When the tint is switched off or a floor falls
 --     out of scope we simply decline to write, and DF's own sprite stands.
 --
@@ -3276,6 +3452,291 @@ local function record_slow_frame(took, upkeep, relearn, level_from, z, moved, sc
     if #slow > SLOW_KEEP then table.remove(slow, 1) end
 end
 
+-- ==========================================
+-- THE QUICK FRAMES (1.3.6)
+-- ==========================================
+-- Every overlay draws on the game's own thread. DF's async_loop (g_src
+-- enabler.cpp) is the simulation thread's loop: it runs render_things, where
+-- DFHack draws the overlays, between the runs of mainloop, the game's tick,
+-- while the main thread waits for it (do_frame: async_cmd::render, then
+-- async_wait). So every millisecond spent here is a millisecond taken from
+-- the game. Measured in play on 2026-11-26 (`stone-tint status`): 5.4 to 5.7
+-- ms a frame on average on an 8,000-cell view, 1.6 to 1.7 of it the fog
+-- below, the rest the scan of every cell and the floor edges' walk of every
+-- flagged cell, every frame, whether anything had changed or not. With
+-- Detailed Weather's own overlay and hook on the same thread, a busy moment in
+-- the fort pushed the sum past a second and the game fell to 50 to 85 FPS for
+-- seconds at a time; paused, the ticks cost nothing and it held 100.
+--
+-- DF still rebuilds the ground layer every frame (see the note below), so
+-- every tile of ours has to be written every frame; but which tiles are ours,
+-- and what each gets, only changes when something moves. So now:
+--   * A FULL FRAME does what every frame did before (every cell scanned,
+--     every flagged cell walked for its edges) and writes down, level by
+--     level, each cell it gave something or left waiting: the cell, the
+--     texture DF drew there (src), what it was given (out, or false while it
+--     waits) and its kind (for the counts). The floor edges write down every
+--     cell they gave anything (paint_edges' rec).
+--   * A QUICK FRAME goes over those cells only. A cell still showing src gets
+--     out back with one write; one showing something else, or still waiting,
+--     goes through paint_cell as in a full frame, and its entry is brought up
+--     to date or dropped (DF draws a texture never ours there now). The edges
+--     are laid again from their record when nothing they rest on moved: no
+--     cell of ours on that level changed, DF's floor flags are as they were
+--     (diffscan) and each recorded cell holds what it held. Otherwise that
+--     level's edges are walked whole and written down again.
+--   * A full frame comes whenever anything that decides what a cell gets
+--     moved (why_full): the view, the level, the view's size or the levels
+--     below shown, a setting (strength, style, edges, ramp overlays, faces,
+--     the switches), DF's textures (the sentinel), DF's own pieces read again
+--     (tokens.gen), Detailed Weather's look, the engravings, a new round of
+--     picture checks (until every check is through), and every FULL_EVERY
+--     frames regardless.
+-- What a quick frame cannot see is a tile that was not ours becoming ours
+-- while the view stands still (a wall dug out, a floor revealed): DF draws
+-- it, and it waits for the next full frame, at most FULL_EVERY - 1 frames,
+-- showing DF's own picture meanwhile, as a tile waiting for its texture always
+-- has. Grass is never ours, so Detailed Weather's grass leaning in the wind
+-- (new textures on every grass tile, as often as every frame) costs nothing
+-- here. `stone-tint replay off` makes every frame a full frame again, for
+-- comparing; `stone-tint status` gives both kinds' counts and times since the
+-- last status, and what called the full frames.
+local FULL_EVERY = 8
+do
+-- What was written down for level L (0 the level you are on, 1 to
+-- LOWER_LEVELS the levels below): cell, src, out and kind side by side, n of
+-- them; changed: whether a cell of ours on it changed this frame (the edges
+-- then walk again); edges: paint_edges' record and DF's floor flags as kept.
+local function level_of(L)
+    local lv = rp.levels[L]
+    if not lv then
+        lv = {cell = {}, src = {}, out = {}, kind = {}, n = 0, changed = true,
+              edges = {cell = {}, ff = {}, bg2 = {}, bg = {}, held = {}, sp = {}, fi = {},
+                       n = 0, count = 0, ok = false, valid = false, raw = nil, raw_cap = 0}}
+        rp.levels[L] = lv
+    end
+    return lv
+end
+
+-- A new map: every level's kept floor flags let go (df.new buffers, freed by
+-- hand), nothing written down holds, and the next frame is a full frame.
+function rp.forget()
+    for _, lv in pairs(rp.levels) do
+        local rec = lv.edges
+        if rec.raw then df.delete(rec.raw) end
+        rec.raw, rec.raw_cap = nil, 0
+    end
+    rp.levels, rp.key.valid, rp.fog.valid = {}, false, false
+end
+
+-- A full frame on one level: every cell DF drew there, as before 1.3.6 (the
+-- levels below the same as the level you are on: THE LEVELS BELOW), each one
+-- given something or left waiting written down.
+function rp.full_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
+    local fx = rp.fx
+    local total, dim_y, win_x, win_y = fx.total, fx.dim_y, fx.win_x, fx.win_y
+    local max_x, max_y = fx.max_x, fx.max_y
+    local known, counts = known_texpos, frame_counts
+    local lv = level_of(L)
+    local cells, srcs, outs, kinds = lv.cell, lv.src, lv.out, lv.kind
+    local n = 0
+    local diffscan = dfhack.internal.diffscan
+    -- (asked for here, not held from elsewhere: THE ZEROS in onRenderFrame)
+    local zeros = diffscan and scan.zeros(total) or nil
+    local base = zeros and scan.base(port, 'screentexpos_background') or nil
+    local scanned, below = 0, 0
+    local cell = 0
+    while cell < total do
+        local drawn = pbg[cell]
+        if drawn == 0 then
+            if base then
+                if cell + 1 >= total then break end
+                cell = diffscan(zeros, base, cell + 1, total, 4)
+                if not cell then break end
+                drawn = pbg[cell]
+            else
+                drawn = nil
+            end
+        end
+        if drawn then
+            scanned = scanned + 1
+            if known[drawn] ~= false then
+                local sx = cell // dim_y
+                local wx = win_x + sx
+                local wy = win_y + cell - sx * dim_y
+                if wx >= 0 and wx < max_x and wy >= 0 and wy < max_y then
+                    this_frame.pend = false
+                    local kind = paint_cell(pbg, pflags, cell, drawn, wx, wy, lz, lcol, lchk)
+                    if kind then
+                        counts[kind] = counts[kind] + 1
+                        if is_lower then below = below + 1 end
+                    end
+                    local after = pbg[cell]
+                    if after ~= drawn or this_frame.pend then
+                        n = n + 1
+                        cells[n], srcs[n] = cell, drawn
+                        outs[n] = after ~= drawn and after or false
+                        kinds[n] = kind or false
+                    end
+                end
+            end
+        end
+        cell = cell + 1
+    end
+    for k = n + 1, lv.n do cells[k], srcs[k], outs[k], kinds[k] = nil, nil, nil, nil end
+    lv.n, lv.changed = n, true
+    fx.scanned, fx.below = fx.scanned + scanned, fx.below + below
+end
+
+-- A quick frame on one level: the cells written down only. One still showing
+-- what it showed gets what it got, in one write; any other goes through
+-- paint_cell as in a full frame.
+function rp.quick_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
+    local fx = rp.fx
+    local dim_y, win_x, win_y = fx.dim_y, fx.win_x, fx.win_y
+    local known, counts = known_texpos, frame_counts
+    local lv = level_of(L)
+    local cells, srcs, outs, kinds = lv.cell, lv.src, lv.out, lv.kind
+    local n, j, changed, below = lv.n, 0, false, 0
+    for i = 1, n do
+        local cell = cells[i]
+        local v = pbg[cell]
+        local src, out, kind = srcs[i], outs[i], kinds[i]
+        local keep = true
+        if v == src and out then
+            pbg[cell] = out
+        else
+            -- Moved on, or still waiting: worked out as a full frame would.
+            local new_out = false
+            if v == 0 or known[v] == false then
+                keep = false
+            else
+                local sx = cell // dim_y
+                this_frame.pend = false
+                kind = paint_cell(pbg, pflags, cell, v, win_x + sx, win_y + cell - sx * dim_y,
+                    lz, lcol, lchk) or false
+                local after = pbg[cell]
+                if after ~= v then new_out = after end
+                keep = new_out or this_frame.pend
+            end
+            if new_out ~= out then changed = true end
+            src, out = v, new_out
+        end
+        if keep then
+            j = j + 1
+            cells[j], srcs[j], outs[j], kinds[j] = cell, src, out, kind
+            if out and kind then
+                counts[kind] = counts[kind] + 1
+                if is_lower then below = below + 1 end
+            end
+        end
+    end
+    for k = j + 1, n do cells[k], srcs[k], outs[k], kinds[k] = nil, nil, nil, nil end
+    lv.n, lv.changed = j, changed
+    fx.scanned, fx.below = fx.scanned + n, fx.below + below
+end
+
+-- Whether a level's recorded edges still stand: DF's floor flags as kept, and
+-- each recorded cell holding what it held (DF's background_two and spatter,
+-- and the floor info of the picture now under it, which a grass tile's new
+-- texture in the wind leaves as it was: none).
+local function edges_hold(rec, port, pbg, total)
+    local diffscan = dfhack.internal.diffscan
+    local ff_base = diffscan and scan.base(port, 'screentexpos_floor_flag') or nil
+    if not ff_base or not rec.raw or rec.raw_cap ~= total then return false end
+    if diffscan(rec.raw, ff_base, 0, total * 2, 4) then return false end
+    local bg2, spatter = port.screentexpos_background_two, port.screentexpos_spatter
+    if not bg2 then return false end
+    local smart = state.edges ~= 'simple'
+    local info = edge.info
+    local rc, rheld, rsp, rfi = rec.cell, rec.held, rec.sp, rec.fi
+    for k = 1, rec.n do
+        local cell = rc[k]
+        if bg2[cell] ~= rheld[k] then return false end
+        if smart then
+            if spatter and spatter[cell] ~= rsp[k] then return false end
+            if (info[pbg[cell]] or false) ~= rfi[k] then return false end
+        end
+    end
+    return true
+end
+
+-- One level's floor edges: laid again from their record on a quick frame
+-- when they still stand, otherwise walked whole (paint_edges) and written
+-- down again, DF's floor flags kept first to tell the next frame whether they
+-- moved.
+function rp.edges_level(L, port, pbg, lz, lcol, full)
+    local fx = rp.fx
+    local total = fx.total
+    local lv = level_of(L)
+    local rec = lv.edges
+    if not full and rec.valid and not lv.changed and edges_hold(rec, port, pbg, total) then
+        local ff, bg2 = port.screentexpos_floor_flag, port.screentexpos_background_two
+        local rc, rff, rb2, rbg = rec.cell, rec.ff, rec.bg2, rec.bg
+        for k = 1, rec.n do
+            local cell = rc[k]
+            local w = rff[k]
+            if w then ff[cell] = w end
+            w = rb2[k]
+            if w then bg2[cell] = w end
+            w = rbg[k]
+            if w then pbg[cell] = w end
+        end
+        edge.count = edge.count + rec.count
+        rp.edges_kept = rp.edges_kept + 1
+        return
+    end
+    local diffscan, memmove = dfhack.internal.diffscan, dfhack.internal.memmove
+    local ff_base = diffscan and memmove and rp.on and scan.base(port, 'screentexpos_floor_flag') or nil
+    if ff_base then
+        if rec.raw_cap ~= total then
+            if rec.raw then df.delete(rec.raw) end
+            rec.raw = df.new('int32_t', total * 2)
+            local _, a = df.sizeof(rec.raw)
+            rec.raw_addr, rec.raw_cap = a, total
+        end
+        memmove(rec.raw_addr, ff_base, total * 8)
+    end
+    rec.ok = false
+    paint_edges(port, pbg, fx.dim_x, fx.dim_y, fx.win_x, fx.win_y, lz, lcol, rec)
+    rec.valid = ff_base ~= nil and rec.ok
+    if not full then rp.edges_redone = rp.edges_redone + 1 end
+end
+
+-- Why this frame has to be a full one, or nil for a quick one. The reasons
+-- are the keys of rp.why, for `stone-tint status`.
+function rp.why_full(z, wx, wy, dx, dy, nl, strength, gmask)
+    if not rp.on then return 'quick frames off' end
+    local K = rp.key
+    if not K.valid then return 'first frame' end
+    if z ~= K.z then return 'level' end
+    if wx ~= K.wx or wy ~= K.wy then return 'view moved' end
+    if dx ~= K.dx or dy ~= K.dy or nl ~= K.nl then return 'view size or levels shown' end
+    if strength ~= K.strength or state.style ~= K.style or state.edges ~= K.edges
+            or frame_overlays ~= K.ov or state.faces ~= K.faces or gmask ~= K.gmask then
+        return 'settings'
+    end
+    if tint_sentinel ~= K.sentinel or tokens.gen ~= K.tokens then return 'textures' end
+    if dw_look ~= K.look then return 'weather look' end
+    if engravings.count ~= K.eng then return 'engravings' end
+    if source_round ~= K.round or K.checks then return 'picture checks' end
+    if frame_id - K.frame >= FULL_EVERY then return 'every 8 frames' end
+    return nil
+end
+
+-- What a full frame rested on, for why_full.
+function rp.keep_key(z, wx, wy, dx, dy, nl, strength, gmask)
+    local K = rp.key
+    K.valid, K.z, K.wx, K.wy, K.dx, K.dy, K.nl = true, z, wx, wy, dx, dy, nl
+    K.strength, K.style, K.edges, K.ov, K.faces, K.gmask =
+        strength, state.style, state.edges, frame_overlays, state.faces, gmask
+    K.sentinel, K.tokens, K.look, K.eng, K.round =
+        tint_sentinel, tokens.gen, dw_look, engravings.count, source_round
+    K.checks = this_frame.checks_put_off > 0
+    K.frame = frame_id
+end
+end
+
 function StoneTintOverlay:onRenderFrame(dc, rect)
     StoneTintOverlay.super.onRenderFrame(self, dc, rect)
 
@@ -3297,6 +3758,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     this_frame.colours, this_frame.colour_s, this_frame.maps, this_frame.map_s = 0, 0, 0, 0
     this_frame.checks, this_frame.check_s, this_frame.reads, this_frame.read_s = 0, 0, 0, 0
     this_frame.made, this_frame.made_s, this_frame.waited = 0, 0, 0
+    this_frame.pend, this_frame.checks_put_off = false, 0
 
     local gps = df.global.gps
     local vp = gps.main_viewport
@@ -3375,11 +3837,9 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     -- replace them.
     local bg = vp.screentexpos_background
     local ramp_flags = vp.screentexpos_ramp_flag
-    local known = known_texpos
     local win_x, win_y = df.global.window_x, df.global.window_y
     local moved = last_win_x ~= nil and (win_x ~= last_win_x or win_y ~= last_win_y)
     last_win_x, last_win_y = win_x, win_y
-    local max_x, max_y = map_max_x, map_max_y
     local counts = frame_counts
     counts[K_FLOOR], counts[K_STAIR], counts[K_RAMP], counts[K_ENGRAVED] = 0, 0, 0, 0
     edge.count = 0
@@ -3389,84 +3849,78 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     frame_overlays = state.overlays == 'tinted' and ov.hidden and ov.slots ~= nil and #ov.slots > 0
     ramp.laid = 0
     local total = dim_x * dim_y
-    local diffscan = dfhack.internal.diffscan
-    local zeros = diffscan and scan.zeros(total) or nil
+    -- THE ZEROS, sized for the whole frame up front (the floor flags take two
+    -- per cell), so nothing below makes the buffer again while another part of
+    -- the frame still holds it. In 1.3.5 the frame held the buffer from
+    -- scan.zeros(total) while paint_edges asked for scan.zeros(total * 2),
+    -- which deleted it for a bigger one, and the levels below went on handing
+    -- the deleted one to diffscan: on the first frame, and on every frame the
+    -- view grew. The parts below each ask scan.zeros for it as they start.
+    scan.zeros(total * 2)
     local edges_on = state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS])
-    local scanned = 0
-    local below = 0
 
-    local function scan_viewport(port, pbg, pflags, lz, lcol, lchk, is_lower)
-        local base = zeros and scan.base(port, 'screentexpos_background') or nil
-        local cell = 0
-        while cell < total do
-            local drawn = pbg[cell]
-            if drawn == 0 then
-                if base then
-                    if cell + 1 >= total then break end
-                    cell = diffscan(zeros, base, cell + 1, total, 4)
-                    if not cell then break end
-                    drawn = pbg[cell]
-                else
-                    drawn = nil
-                end
-            end
-            if drawn then
-                scanned = scanned + 1
-                if known[drawn] ~= false then
-                    local sx = cell // dim_y
-                    local wx = win_x + sx
-                    local wy = win_y + cell - sx * dim_y
-                    if wx >= 0 and wx < max_x and wy >= 0 and wy < max_y then
-                        local kind = paint_cell(pbg, pflags, cell, drawn, wx, wy, lz, lcol, lchk)
-                        if kind then
-                            counts[kind] = counts[kind] + 1
-                            if is_lower then below = below + 1 end
-                        end
-                    end
-                end
-            end
-            cell = cell + 1
-        end
-    end
-
-    local colours, checks = level_caches(z)
-    scan_viewport(vp, bg, ramp_flags, z, colours, checks, false)
-    if edges_on then
-        paint_edges(vp, bg, dim_x, dim_y, win_x, win_y, z, colours)
-    end
-
+    -- THE LEVELS BELOW shown this frame: each in order, active and the main
+    -- view's size, down to the map's floor.
     local lower = gps.lower_viewport
+    local n_lower = 0
     for i = 0, LOWER_LEVELS - 1 do
-        local lz = z - i - 1
-        if lz < 0 then break end
+        if z - i - 1 < 0 then break end
         local lvp = lower and lower[i]
         if not lvp or not lvp.flag.active or lvp.dim_x ~= dim_x or lvp.dim_y ~= dim_y then break end
-        local lbg, lflags = lvp.screentexpos_background, lvp.screentexpos_ramp_flag
-        if not lbg or not lflags then break end
-        colours, checks = level_caches(lz)
-        scan_viewport(lvp, lbg, lflags, lz, colours, checks, true)
-        if edges_on then
-            paint_edges(lvp, lbg, dim_x, dim_y, win_x, win_y, lz, colours)
-        end
+        if not lvp.screentexpos_background or not lvp.screentexpos_ramp_flag then break end
+        n_lower = i + 1
     end
+
+    -- THE QUICK FRAMES: a full frame, or the cells written down at the last one.
+    local gmask = 0
+    for g = 1, G_ENGRAVED do
+        if enabled[g] then gmask = gmask | (1 << g) end
+    end
+    local fx = rp.fx
+    fx.total, fx.dim_x, fx.dim_y, fx.win_x, fx.win_y = total, dim_x, dim_y, win_x, win_y
+    fx.max_x, fx.max_y, fx.scanned, fx.below = map_max_x, map_max_y, 0, 0
+    local why = rp.why_full(z, win_x, win_y, dim_x, dim_y, n_lower, strength, gmask)
+    local full = why ~= nil
+    if full then rp.why[why] = (rp.why[why] or 0) + 1 end
+    local run_level = full and rp.full_level or rp.quick_level
+
+    local colours, checks = level_caches(z)
+    run_level(0, vp, bg, ramp_flags, z, colours, checks, false)
+    if edges_on then rp.edges_level(0, vp, bg, z, colours, full) end
+    for i = 0, n_lower - 1 do
+        local lz = z - i - 1
+        local lvp = lower[i]
+        local lbg = lvp.screentexpos_background
+        colours, checks = level_caches(lz)
+        run_level(i + 1, lvp, lbg, lvp.screentexpos_ramp_flag, lz, colours, checks, true)
+        if edges_on then rp.edges_level(i + 1, lvp, lbg, lz, colours, full) end
+    end
+    if full then rp.keep_key(z, win_x, win_y, dim_x, dim_y, n_lower, strength, gmask) end
 
     stone_tint_stats.floors = counts[K_FLOOR]
     stone_tint_stats.engraved = counts[K_ENGRAVED]
     stone_tint_stats.stairs = counts[K_STAIR]
     stone_tint_stats.ramps = counts[K_RAMP]
-    stone_tint_stats.below = below
+    stone_tint_stats.below = fx.below
     stone_tint_stats.edges = edge.count
-    stone_tint_stats.laid = ramp.laid
+    -- (a quick frame lays the ramps' overlays from the list, without counting
+    -- them: the last full frame's count stands)
+    if full then stone_tint_stats.laid = ramp.laid end
     local took = (clock() - started) * 1000
     stone_tint_stats.frame_ms = timed_average(stone_tint_stats.frame_ms, took)
     stone_tint_stats.worst_ms = math.max(stone_tint_stats.worst_ms or 0, took)
+    if full then
+        rp.full_n, rp.full_ms = rp.full_n + 1, timed_average(rp.full_ms, took)
+    else
+        rp.quick_n, rp.quick_ms = rp.quick_n + 1, timed_average(rp.quick_ms, took)
+    end
     add_cost('materials', this_frame.colours, this_frame.colour_s)
     add_cost('maps', this_frame.maps, this_frame.map_s)
     add_cost('looks', this_frame.checks, this_frame.check_s)
     add_cost('reads', this_frame.reads, this_frame.read_s)
     add_cost('made', this_frame.made, this_frame.made_s)
     if took >= SLOW_FRAME_MS then
-        record_slow_frame(took, upkeep, relearn, level_from, z, moved, scanned)
+        record_slow_frame(took, upkeep, relearn, level_from, z, moved, fx.scanned)
     end
 end
 
@@ -3499,6 +3953,8 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
         -- map's load moves DF's textures, which reads them, THE OVERLAY)
         engravings.count, engravings.by_level = -1, {}
         reset_cache(nil)
+        -- (THE QUICK FRAMES) nothing written down on another map holds here
+        rp.forget()
     elseif sc == SC_MAP_UNLOADED or sc == SC_WORLD_UNLOADED then
         -- Put DF's ramp overlays and shadows back; the next map redoes them.
         show_ramp_overlays()
@@ -3511,6 +3967,7 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
         reset_tints(true)
         reset_material_caches()
         engravings.count, engravings.by_level = -1, {}
+        rp.forget()
         if sc == SC_WORLD_UNLOADED then
             -- Colour indices belong to a world. The textures are not deleted
             -- (see make_texture); they are only forgotten.
@@ -3733,6 +4190,29 @@ function stone_tint_command(...)
             .. '(%.3f ms each), %s'):format(fast.on and 'on' or 'OFF', fast.checked,
             fast.full_n > 0 and fast.full_s * 1000 / fast.full_n or 0,
             fast.note and ('differed at ' .. fast.note) or 'none differed'))
+        -- THE QUICK FRAMES: both kinds' counts since the last status and their
+        -- running average times, what called each full frame, the cells on the
+        -- list as the last frame left it, and how often the edges and the fog
+        -- below were laid again from their record. The counts then start over.
+        local why = {}
+        for k, v in pairs(rp.why) do why[#why + 1] = ('%s %d'):format(k, v) end
+        table.sort(why)
+        print(('stone-tint: since last status, quick frames %s: %d at %.2f ms on average; full '
+            .. 'frames %d at %.2f ms; full frames called by: %s'):format(rp.on and 'on' or 'OFF', rp.quick_n, rp.quick_ms or 0,
+            rp.full_n, rp.full_ms or 0, #why > 0 and table.concat(why, ', ') or 'nothing yet'))
+        local listed = {}
+        for L = 0, LOWER_LEVELS do
+            local lv = rp.levels[L]
+            if lv and lv.n > 0 then
+                listed[#listed + 1] = (L == 0 and 'this level %d' or (L .. ' down %d')):format(lv.n)
+            end
+        end
+        print(('stone-tint: cells on the quick frames\' list: %s; floor edges laid again from their '
+            .. 'record %d times, walked again %d; the fog below kept %d frames, walked %d')
+            :format(#listed > 0 and table.concat(listed, ', ') or 'none', rp.edges_kept,
+            rp.edges_redone, rp.fog.kept, rp.fog.walked))
+        rp.quick_n, rp.full_n, rp.why, rp.edges_kept, rp.edges_redone = 0, 0, {}, 0, 0
+        rp.fog.kept, rp.fog.walked = 0, 0
         stats.worst_ms, stats.upkeep_worst_ms = 0, 0
         if hidden then
             print(('stone-tint: DF\'s ramp overlays hidden (%d DF table entries), %s'):format(hidden,
@@ -3768,6 +4248,14 @@ function stone_tint_command(...)
         state.edges = args[2]
         save_state()
         force_repaint()
+    elseif args[1] == 'replay' then
+        -- THE QUICK FRAMES on or off for this session (off: every frame a full
+        -- frame, as before 1.3.6), for comparing.
+        if args[2] == 'on' then rp.on = true
+        elseif args[2] == 'off' then rp.on = false
+        else qerror('replay must be on or off') end
+        rp.key.valid, rp.fog.valid = false, false
+        print(('stone-tint: quick frames %s'):format(rp.on and 'on' or 'off: every frame is a full frame'))
     else
         print('Use: stone-tint [gui]')
         print('     overlay enable stone-tint.map')
@@ -3777,6 +4265,7 @@ function stone_tint_command(...)
         print('     stone-tint set <' .. table.concat(STRENGTHS, '|') .. '>')
         print('     stone-tint style <keep|smooth|classic>')
         print('     stone-tint edges <smart|simple|off>')
+        print('     stone-tint replay <on|off>')
     end
 end
 
