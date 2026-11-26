@@ -1947,7 +1947,7 @@ local function apply_shades()
             end
         end
     end
-    local made, slots, probes, seen_tbl = {}, {}, {}, {}
+    local made, slots, probes, seen_tbl, black_set = {}, {}, {}, {}, {}
     local gps = df.global.gps
     for _, name in ipairs(TEXTURE_TABLES) do
         local ok, arr = pcall(function() return gps[name] end)
@@ -1962,7 +1962,10 @@ local function apply_shades()
                         local px = shaded_pixels(v, kind, rounded, flat_alpha)
                         local t, handle
                         if px then t, handle = copy_texpos(px, true) end
-                        if t then copy = {texpos=t, handle=handle} end
+                        if t then
+                            copy = {texpos=t, handle=handle}
+                            if kind == 'fog' then black_set[t] = true end
+                        end
                         made[v] = copy
                     end
                     if copy then
@@ -1982,7 +1985,8 @@ local function apply_shades()
     -- Marked applied even when nothing was found, so the tables are not
     -- searched again every frame; status reports the count. flat: whether
     -- ramp fog is filled flat, for the fog DF builds below (FOG BELOW).
-    sh.slots, sh.probes, sh.applied, sh.flat, sh.flat_alpha = slots, probes, true, rounded, flat_alpha
+    sh.slots, sh.probes, sh.applied, sh.flat, sh.flat_alpha, sh.black_set =
+        slots, probes, true, rounded, flat_alpha, black_set
 end
 
 local function remove_shades()
@@ -1995,7 +1999,7 @@ local function remove_shades()
             if gps[s[1]][s[2]] == s[5] then gps[s[1]][s[2]] = s[3] end
         end)
     end
-    sh.slots, sh.probes, sh.applied = nil, nil, false
+    sh.slots, sh.probes, sh.applied, sh.black_set = nil, nil, false, nil
 end
 
 -- Keep the shadows the way the settings ask, as update_ramp_overlays does the
@@ -2003,10 +2007,12 @@ end
 -- if DF rebuilt its tables or moved a copy.
 local function refresh_shades()
     local gps = df.global.gps
+    local black_set = {}
     for _, s in ipairs(stone_tint_shades.slots) do
         local copy = s[4]
         local t = dfhack.textures.getTexposByHandle(copy.handle)
         if t and t > 0 then copy.texpos = t end
+        black_set[copy.texpos] = true
         pcall(function()
             local arr = gps[s[1]]
             local v = arr[s[2]]
@@ -2015,6 +2021,7 @@ local function refresh_shades()
             s[5] = copy.texpos
         end)
     end
+    stone_tint_shades.black_set = black_set
     df.global.gps.force_full_display_count = 1
 end
 function update_shades()
@@ -2124,9 +2131,30 @@ local function fog_copy(t)
     if black then
         copy = copy_texpos(black, false)
         if not copy then return nil end
+        if stone_tint_shades.black_set then stone_tint_shades.black_set[copy] = true end
     end
     fog_copies[t] = {copy=copy, addr=addr, sig=sig, round=source_round}
     return copy
+end
+
+-- Reusable zero buffer + viewport pointer helper for C++ diffscan zero-skipping.
+local scan = {buf = nil, size = 0}
+function scan.zeros(n)
+    if scan.size < n then
+        if scan.buf then df.delete(scan.buf) end
+        local buf = df.new('int32_t', n)
+        for k = 0, n - 1 do buf[k] = 0 end
+        scan.buf, scan.size = buf, n
+    end
+    return scan.buf
+end
+function scan.addr(vp, field)
+    local _, at = df.sizeof(vp:_field(field))
+    return at and df.reinterpret_cast('uint64_t', at).value or nil
+end
+function scan.base(vp, field)
+    local ok, addr = pcall(scan.addr, vp, field)
+    return (ok and addr and addr ~= 0) and addr or nil
 end
 
 -- Each frame: the fog layer of the levels below, made black.
@@ -2134,19 +2162,44 @@ local function paint_fog()
     if not state.black_shadows or not stone_tint_shades.applied then return end
     local lvp = df.global.gps.lower_viewport[0]
     if not lvp or not lvp.flag.active then return end
+    local total = lvp.dim_x * lvp.dim_y
+    if total <= 0 then return end
     fog_reads = FOG_READS_PER_FRAME
     local layer = lvp.screentexpos_interface
+    local black_set = stone_tint_shades.black_set
+    local fc, sr = fog_copies, source_round
+    local diffscan = dfhack.internal.diffscan
+    local base = diffscan and scan.base(lvp, 'screentexpos_interface') or nil
+    local zeros = base and scan.zeros(total) or nil
     local deferred = false
-    for i = 0, lvp.dim_x * lvp.dim_y - 1 do
+    local i = 0
+    while i < total do
         local t = layer[i]
-        if t ~= 0 then
-            local copy = fog_copy(t)
+        if t == 0 then
+            if zeros then
+                if i + 1 >= total then break end
+                i = diffscan(zeros, base, i + 1, total, 4)
+                if not i then break end
+                t = layer[i]
+            else
+                t = nil
+            end
+        end
+        if t and (not black_set or not black_set[t]) then
+            local c = fc[t]
+            local copy
+            if c and c.round == sr then
+                copy = c.copy
+            else
+                copy = fog_copy(t)
+            end
             if copy then
                 layer[i] = copy
             elseif copy == nil then
                 deferred = true
             end
         end
+        i = i + 1
     end
     if deferred then
         stone_tint_shades.fog_pending = true
@@ -2509,7 +2562,12 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     -- screen did at each change of weather). A texture's first sight since the
     -- last reset also files it: never looked at again when no picture on a
     -- tile like this one is ours.
-    local original = dw_memo.active and dw_original(drawn) or nil
+    local original
+    if dw_memo.active then
+        original = dw_memo.filed[drawn]
+        if original == nil then original = dw_original(drawn) end
+        if not original then original = nil end
+    end
     local key = original or drawn
     local ccol = checks[wx]
     if not ccol then ccol = {} checks[wx] = ccol end
@@ -3055,23 +3113,49 @@ end
 -- floor_flag so DF draws everything in its native order.
 -- simple: writes tinted edges into bg2 over whatever DF draws.
 -- off: leaves all floor edges to DF.
-paint_edges = function(port, bg, cells, n, dim_x, dim_y, win_x, win_y, z, colours)
-    if n == 0 or state.edges == 'off' then return end
+paint_edges = function(port, bg, dim_x, dim_y, win_x, win_y, z, colours)
+    if state.edges == 'off' then return end
     local ff, bg2 = port.screentexpos_floor_flag, port.screentexpos_background_two
     if not ff or not bg2 then return end
-    if resolved_frame ~= frame_id then resolve_edge_pieces() end
+    local total = dim_x * dim_y
+    if total <= 0 then return end
+    local diffscan = dfhack.internal.diffscan
+    local ff_base = diffscan and scan.base(port, 'screentexpos_floor_flag') or nil
+    local zeros = ff_base and scan.zeros(total * 2) or nil
+    local total2 = total * 2
     local spatter = port.screentexpos_spatter
     local smart = state.edges ~= 'simple'
     local info, ours = edge.info, edge.ours
-    for k = 1, n do
-        local cell = cells and cells[k] or k - 1
+    local flag_ok = edge.flag_ok
+    if not flag_ok then flag_ok = {} edge.flag_ok = flag_ok end
+    local cell = 0
+    while cell < total do
         local flag = ff[cell]
-        if flag ~= 0 and flag >> 32 == 0 then
-            local b0 = flag & 0xFF
-            local b1 = (flag >> 8) & 0xFF
-            local b2 = (flag >> 16) & 0xFF
-            local b3 = (flag >> 24) & 0xFF
-            if EDGINGS[b0] or EDGINGS[b1] or EDGINGS[b2] or EDGINGS[b3] then
+        if flag == 0 then
+            if zeros then
+                local start = (cell + 1) * 2
+                if start >= total2 then break end
+                local hit = diffscan(zeros, ff_base, start, total2, 4)
+                if not hit then break end
+                cell = hit >> 1
+                flag = ff[cell]
+            else
+                flag = nil
+            end
+        end
+        if flag and flag ~= 0 and flag >> 32 == 0 then
+            local has = flag_ok[flag]
+            if has == nil then
+                has = (EDGINGS[flag & 0xFF] or EDGINGS[(flag >> 8) & 0xFF]
+                    or EDGINGS[(flag >> 16) & 0xFF] or EDGINGS[(flag >> 24) & 0xFF]) ~= nil
+                flag_ok[flag] = has
+            end
+            if has then
+                if resolved_frame ~= frame_id then resolve_edge_pieces() end
+                local b0 = flag & 0xFF
+                local b1 = (flag >> 8) & 0xFF
+                local b2 = (flag >> 16) & 0xFF
+                local b3 = (flag >> 24) & 0xFF
                 local held = bg2[cell]
                 local stale = held ~= 0 and ours[held]
                 if stale then
@@ -3114,6 +3198,7 @@ paint_edges = function(port, bg, cells, n, dim_x, dim_y, win_x, win_y, z, colour
                 if stale and not wrote_bg2 then bg2[cell] = 0 end
             end
         end
+        cell = cell + 1
     end
 end
 end)()
@@ -3303,85 +3388,66 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     local ov = stone_tint_overlays
     frame_overlays = state.overlays == 'tinted' and ov.hidden and ov.slots ~= nil and #ov.slots > 0
     ramp.laid = 0
-    local colours, checks = level_caches(z)
-    local open, n_open = see_through, 0
-    local scanned = dim_x * dim_y         -- cells looked at this frame, for the report
+    local total = dim_x * dim_y
+    local diffscan = dfhack.internal.diffscan
+    local zeros = diffscan and scan.zeros(total) or nil
+    local edges_on = state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS])
+    local scanned = 0
+    local below = 0
 
-    -- The level you are on. index = sx * dim_y + sy, so iterating sy innermost
-    -- lets it just increment.
-    local index = 0
-    for sx = 0, dim_x - 1 do
-        local wx = win_x + sx
-        if wx < 0 or wx >= max_x then
-            index = index + dim_y
-        else
-            for sy = 0, dim_y - 1 do
-                local drawn = bg[index]          -- the texpos DF drew here this frame
-                if drawn == 0 then
-                    -- Nothing drawn here: the level below shows through.
-                    n_open = n_open + 1
-                    open[n_open] = index
-                elseif known[drawn] ~= false then
-                    local wy = win_y + sy
-                    if wy >= 0 and wy < max_y then
-                        local kind = paint_cell(bg, ramp_flags, index, drawn, wx, wy, z,
-                            colours, checks)
-                        if kind then counts[kind] = counts[kind] + 1 end
+    local function scan_viewport(port, pbg, pflags, lz, lcol, lchk, is_lower)
+        local base = zeros and scan.base(port, 'screentexpos_background') or nil
+        local cell = 0
+        while cell < total do
+            local drawn = pbg[cell]
+            if drawn == 0 then
+                if base then
+                    if cell + 1 >= total then break end
+                    cell = diffscan(zeros, base, cell + 1, total, 4)
+                    if not cell then break end
+                    drawn = pbg[cell]
+                else
+                    drawn = nil
+                end
+            end
+            if drawn then
+                scanned = scanned + 1
+                if known[drawn] ~= false then
+                    local sx = cell // dim_y
+                    local wx = win_x + sx
+                    local wy = win_y + cell - sx * dim_y
+                    if wx >= 0 and wx < max_x and wy >= 0 and wy < max_y then
+                        local kind = paint_cell(pbg, pflags, cell, drawn, wx, wy, lz, lcol, lchk)
+                        if kind then
+                            counts[kind] = counts[kind] + 1
+                            if is_lower then below = below + 1 end
+                        end
                     end
                 end
-                index = index + 1
             end
+            cell = cell + 1
         end
     end
 
-    -- FLOOR EDGES on this level (runs whenever rough stone or soil is enabled,
-    -- so off-screen rough floors still tint lips along the screen border).
-    if state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS]) then
-        paint_edges(vp, bg, nil, dim_x * dim_y, dim_x, dim_y, win_x, win_y, z, colours)
+    local colours, checks = level_caches(z)
+    scan_viewport(vp, bg, ramp_flags, z, colours, checks, false)
+    if edges_on then
+        paint_edges(vp, bg, dim_x, dim_y, win_x, win_y, z, colours)
     end
 
-    -- The levels below, one at a time, through the cells left empty above
-    -- (see THE LEVELS BELOW). A cell empty again on this level goes on the
-    -- list for the next one down.
-    local below = 0
     local lower = gps.lower_viewport
-    local next_open = see_next
     for i = 0, LOWER_LEVELS - 1 do
         local lz = z - i - 1
-        if n_open == 0 or lz < 0 then break end
+        if lz < 0 then break end
         local lvp = lower and lower[i]
         if not lvp or not lvp.flag.active or lvp.dim_x ~= dim_x or lvp.dim_y ~= dim_y then break end
         local lbg, lflags = lvp.screentexpos_background, lvp.screentexpos_ramp_flag
         if not lbg or not lflags then break end
-        scanned = scanned + n_open
         colours, checks = level_caches(lz)
-        local n_next = 0
-        for k = 1, n_open do
-            local cell = open[k]
-            local drawn = lbg[cell]
-            if drawn == 0 then
-                n_next = n_next + 1
-                next_open[n_next] = cell
-            elseif known[drawn] ~= false then
-                local sx = cell // dim_y
-                local wy = win_y + cell - sx * dim_y
-                if wy >= 0 and wy < max_y then
-                    local kind = paint_cell(lbg, lflags, cell, drawn, win_x + sx, wy, lz,
-                        colours, checks)
-                    if kind then
-                        counts[kind] = counts[kind] + 1
-                        below = below + 1
-                    end
-                end
-            end
+        scan_viewport(lvp, lbg, lflags, lz, colours, checks, true)
+        if edges_on then
+            paint_edges(lvp, lbg, dim_x, dim_y, win_x, win_y, lz, colours)
         end
-        -- This level's floor edges, as on the level above: every cell of it
-        -- that shows (open), including lips cast by rough floors tucked under
-        -- an overhang on the level above.
-        if state.edges ~= 'off' and (group_enabled[G_ROUGH] or group_enabled[G_SOIL_FLOORS]) then
-            paint_edges(lvp, lbg, open, n_open, dim_x, dim_y, win_x, win_y, lz, colours)
-        end
-        open, next_open, n_open = next_open, open, n_next
     end
 
     stone_tint_stats.floors = counts[K_FLOOR]
