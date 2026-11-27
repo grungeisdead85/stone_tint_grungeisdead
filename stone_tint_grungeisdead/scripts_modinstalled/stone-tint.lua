@@ -251,7 +251,9 @@ local LOWER_LEVELS = 8
 -- map once (tile_checks). One table for every level, so the common cell costs
 -- one lookup. Emptied on every change of level, when DF's textures move and
 -- when Detailed Weather's look changes: DF renumbers its run-time textures as
--- it draws, and Detailed Weather frees a look's copies.
+-- it draws, and Detailed Weather frees a look's copies. (1.3.11) And whenever
+-- DF makes its viewport buffers again (THE BUFFERS REMADE: every turn of the
+-- zoom wheel), for the same reason: NUMBERS GIVEN AGAIN, at rp.note_buffers.
 local known_texpos = {}
 local cached_z
 -- Per level, since the levels below are drawn too. Both are kept while their
@@ -354,19 +356,32 @@ local frame_counts = {0, 0, 0, 0}
 -- THE QUICK FRAMES (1.3.6): what a full frame wrote down, kept for the quick
 -- frames after it, and their counts for `stone-tint status`. One table, as
 -- this_frame is below. See the section of that name above onRenderFrame.
---   on        quick frames allowed (`stone-tint replay on|off`, this session)
+--   on        quick frames allowed (`stone-tint replay on|off`, this session;
+--             on by default, off in 1.3.11 only: QUICK FRAMES KEPT, at THE
+--             QUICK FRAMES)
 --   levels    [0 the level you are on, 1 to LOWER_LEVELS below] = what was
 --             written down for that level (level_of)
 --   key       what the last full frame rested on (keep_key, why_full)
 --   fx        this frame's view, for the functions below (set each frame)
 --   fog       THE FOG KEPT
 --   why       [reason] = full frames it has called since the last status
+--   bufs      THE BUFFERS REMADE (1.3.9): the main view's ground buffer and
+--             its _old twin as the last frame found them (cur, old), the
+--             buffer the frame before that drew in (prev), and how many full
+--             frames a remake still calls (tail; full on a remake)
+--   view      HOLD (1.3.10): the last frame's level, corner, size, levels
+--             below and texture sentinel; held_n: tiles held since the last
+--             status
+--   first_n   FILED FIRST (1.3.13): numbers read past the cap since the last
+--             status
 -- (A console command is answered by the copy already running, A COMMAND
 -- WHILE THE OVERLAY IS RUNNING, so all of this lasts the session.)
 local rp = {on = true, levels = {}, key = {valid = false}, fx = {}, why = {},
             quick_n = 0, full_n = 0, quick_ms = nil, full_ms = nil,
             edges_kept = 0, edges_redone = 0,
-            fog = {valid = false, cap = 0, kept = 0, walked = 0, skipped = 0}}
+            fog = {valid = false, cap = 0, kept = 0, walked = 0, skipped = 0},
+            bufs = {cur = nil, old = nil, prev = nil, tail = 0, full = 3},
+            view = {}, held_n = 0, empty_n = 0, first_n = 0}
 
 -- ==========================================
 -- TIMING AND THE FRAME'S WORK CAP
@@ -382,6 +397,9 @@ local clock = os.clock
 -- every tile on screen in one frame.
 local WORK_MS = 8
 local work_until = 0              -- the clock time this frame's costly work stops at
+-- FILED FIRST (1.3.13, at paint_cell): at most this many texture numbers a
+-- frame are read past the cap to be filed.
+local FIRST_MOST = 1000
 local function can_work() return clock() < work_until end
 -- This frame's costly work, for THE SLOW FRAME REPORT: how many of each, and
 -- the seconds they took. Started over at the top of each frame. One table,
@@ -394,6 +412,8 @@ local this_frame = {
     reads = 0, read_s = 0,         -- pictures read whole
     made = 0, made_s = 0,          -- textures made
     waited = 0,                    -- tiles left for a later frame by the cap
+    first = 0,                     -- (1.3.13, FILED FIRST) numbers read past the cap to be filed
+    held = 0,                      -- (1.3.10, HOLD) tiles shown their last tint while they waited
     -- (1.3.6, THE QUICK FRAMES) pend: set by paint_cell when it left a tile for
     -- a later frame (no time left, a picture not read yet, a texture not made
     -- yet), so the tile stays on the quick frames' list and is tried again.
@@ -2495,6 +2515,9 @@ local function change_level(z)
         if math.abs(lz - z) > KEEP_LEVELS then edge.sources[lz] = nil end
     end
     reset_known()
+    -- (1.3.11, NUMBERS GIVEN AGAIN) DF renumbers its run-time pictures on a level
+    -- not seen before: each picture is checked again as it is next drawn
+    source_round, source_round_at = source_round + 1, dfhack.getTickCount()
 end
 
 -- One level's colour and tile check tables, made on first need.
@@ -2729,6 +2752,22 @@ end
 -- on and the levels below, so both tint the same way. Every map read and
 -- material lookup in here waits for a later frame once this frame's work is
 -- spent (THE FRAME'S WORK CAP), and the cell keeps DF's own picture until then.
+--
+-- FILED FIRST (1.3.13). One exception: the first cell of a texture number not
+-- filed yet (known_texpos nil) is read whatever the cap, up to FIRST_MOST a
+-- frame. Its one read files the number, and when the tile is never ours (a
+-- wall, grass) every other cell showing it is passed over by the scan from
+-- then on. Waiting, a number stays unfiled, so every cell showing it came back
+-- into here, found its own tile check stale and waited too. A remake forgets
+-- every filing (NUMBERS GIVEN AGAIN), and DF gives its put-together pictures
+-- (walls among them) new numbers on a remake, so the tile checks, kept by the
+-- number each cell showed, were stale on every wall at once. Seen in play
+-- 2026-11-27 (1.3.12): bursts of up to 8 frames in a row of 40 to 54 ms with
+-- the view standing still, every one of 73,440 cells scanned and 46,000 to
+-- 60,000 left waiting each frame, a few hundred filed per frame by the cap.
+-- Those waiting cells went on the quick frames' list as well, so the quick
+-- frames after them paid for them too. The cells of a number that is ours
+-- (filed true) still wait for their own reads under the cap, as before.
 local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     -- What this tile is, read off the map once and kept against the picture DF
     -- drew there: under a Detailed Weather look, its copy's original, so the
@@ -2747,7 +2786,13 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     if not ccol then ccol = {} checks[wx] = ccol end
     local check = ccol[wy]
     if not check or check.texpos ~= key then
-        if not can_work() then this_frame.waited = this_frame.waited + 1 this_frame.pend = true return nil end
+        if not can_work() then
+            -- FILED FIRST: past the cap, only a number not filed yet is read
+            if known_texpos[drawn] ~= nil or this_frame.first >= FIRST_MOST then
+                this_frame.waited = this_frame.waited + 1 this_frame.pend = true return nil
+            end
+            this_frame.first = this_frame.first + 1
+        end
         local t0 = clock()
         local id, never = tile_kind(wx, wy, z, flags[index])
         check = {texpos=key, id=id, never=never}
@@ -3526,6 +3571,27 @@ end
 -- ==========================================
 -- THE QUICK FRAMES (1.3.6)
 -- ==========================================
+-- FULL FRAMES AGAIN (1.3.11): the quick frames are off by default, every frame
+-- a full frame as up to 1.3.5, and `stone-tint replay on` turns them on for the
+-- session. They were made to win back frame time for the FPS drops, and they
+-- did (about 5.5 ms a frame down to about 1), but the drops turned out to be
+-- stalls inside DF's own tick (fps-probe 1.1, 2026-11-26), and the quick
+-- frames rest on DF keeping its buffers from one frame to the next, which it
+-- doesn't on a zoom: every turn of the wheel makes them again (THE BUFFERS
+-- REMADE). They cost the whole view's tint on every zoom (1.3.6 to 1.3.8),
+-- then a burst of full frames on every turn of the wheel to put it back (1.3.9
+-- and 1.3.10: a laggy zoom). A full frame works out every cell DF drew, so a
+-- remake costs it nothing to recover from. HOLD, NUMBERS GIVEN AGAIN and EMPTY
+-- BUFFERS serve both kinds.
+-- QUICK FRAMES KEPT (1.3.12): on by default again. With them off the full
+-- frames' cost came back, and the sim FPS drops with it (seen in play
+-- 2026-11-27, within minutes of loading 1.3.11: down to 70 again). The drops
+-- are stalls in DF's own tick, but with drawing taking most of each second
+-- (fps-probe 1.1: 550 to 760 ms of it) every millisecond the overlay takes
+-- decides how often a stall costs a frame. What made them a bad bargain on a
+-- zoom is dealt with apart: THE BUFFERS REMADE, HOLD and NUMBERS GIVEN AGAIN for
+-- the tint, EMPTY BUFFERS for the frames on empty buffers that made a fast zoom
+-- lag. `stone-tint replay off` still gives every frame a full frame.
 -- Every overlay draws on the game's own thread. DF's async_loop (g_src
 -- enabler.cpp) is the simulation thread's loop: it runs render_things, where
 -- DFHack draws the overlays, between the runs of mainloop, the game's tick,
@@ -3560,8 +3626,9 @@ end
 --     moved (why_full): the view, the level, the view's size or the levels
 --     below shown, a setting (strength, style, edges, ramp overlays, faces,
 --     the switches), DF's textures (the sentinel), DF's own pieces read again
---     (tokens.gen), Detailed Weather's look, the engravings, and every
---     FULL_EVERY frames regardless.
+--     (tokens.gen), Detailed Weather's look, the engravings, DF's buffers
+--     made again (THE BUFFERS REMADE, 1.3.9), and every FULL_EVERY frames
+--     regardless.
 --   * Not a new round of picture checks (THE ART AS DRAWN, every
 --     SOURCE_CHECK_MS): the full frame every FULL_EVERY frames runs a
 --     round's checks, as every full frame does (paint_cell asks source_for),
@@ -3587,7 +3654,7 @@ do
 local function level_of(L)
     local lv = rp.levels[L]
     if not lv then
-        lv = {cell = {}, src = {}, out = {}, kind = {}, n = 0, changed = true,
+        lv = {cell = {}, src = {}, out = {}, kind = {}, last = {}, n = 0, changed = true,
               edges = {cell = {}, ff = {}, bg2 = {}, bg = {}, held = {}, sp = {}, fi = {},
                        n = 0, count = 0, ok = false, valid = false, raw = nil, raw_cap = 0}}
         rp.levels[L] = lv
@@ -3606,6 +3673,121 @@ function rp.forget()
     rp.levels, rp.key.valid, rp.fog.valid = {}, false, false
 end
 
+-- THE BUFFERS REMADE (1.3.9). DF makes every viewport's buffers again,
+-- zeroed (g_src graphics.cpp: reshape_viewports, set_dims_and_allocate), on
+-- each turn of the wheel: on a zoom, and also where the view's size and the
+-- zoom factor stay as they were (in the trace, at both ends of the zoom, zoom
+-- factors 64 and 256). Measured in
+-- play with `stone-tint trace` (THE ZOOM TRACE, 2026-11-27): through fast
+-- zooms the ground buffer's address kept changing at the same size and zoom
+-- factor, and the frame on the new buffers found them empty. The quick frame
+-- then dropped every entry on its lists (a cell showing nothing is no longer
+-- ours), and the frames after it, DF's drawing back, had nothing listed and
+-- nothing calling a full frame: the whole view, every level, showed DF's own
+-- pictures until the next full frame (up to FULL_EVERY - 1 frames), again on
+-- every turn of the wheel. DF showed those frames: the flash. A full frame on
+-- an empty buffer finds nothing to keep either, so a remake now calls full
+-- frames on its own frame and the bufs.full - 1 after it, each remake starting
+-- the count again (in the trace DF had drawn into a remade buffer on its own
+-- frame or within the two after).
+-- A remake is told by the pair of addresses. swap_arrays swaps each buffer
+-- with its _old twin every frame, so in an unbroken run a frame finds as its
+-- _old the buffer the frame before drew in, and as its buffer that frame's
+-- _old; anything else is a new pair. The buffer's address alone is not
+-- enough: the trace saw a remade buffer come back at an address used before.
+-- (Should the _old field ever be unreadable, the buffer is checked against
+-- the one drawn in two frames before, which an unbroken run alternates with.)
+--
+-- NUMBERS GIVEN AGAIN (1.3.11). DF gives its put-together pictures (ramps
+-- among them) new texture numbers on a zoom (PICTURES BY MEMCMP) and hands a
+-- freed number to the next picture it makes (Detailed Weather's grass.lua
+-- notes it for trees, workshops and ramps), and stone-tint filed pictures by
+-- number in two places that a zoom didn't touch:
+--   * known_texpos: a number first seen on a tile that is never ours (a wall,
+--     grass) is filed false, and every cell showing it is passed over until
+--     the next change of level. A ramp given such a number after a zoom stayed
+--     DF's own picture, untinted, until the next zoom gave it another number:
+--     a ramp flickering on its own while zooming. Seen in play 2026-11-27, which
+--     this can do; nothing counted it, as a cell passed over is in no list (the
+--     trace counts it now: skipped).
+--   * the sources by number (stone_tint_sources.by_texpos): a number checked
+--     in this round of picture checks is taken as the same picture until the
+--     next round (SOURCE_CHECK_MS, 2 seconds), so a ramp under a number given
+--     again could be tinted from the picture the number held before.
+-- So a remake also forgets every filing (reset_known: known_texpos and
+-- Detailed Weather's answers) and starts a new round of checks: each number
+-- on screen is filed again from its first cell (one map read at most, the
+-- tile checks are kept by map tile) and each picture checked again by its 16
+-- pixels (CHECKS_PER_FRAME a frame) as it is next drawn. A change of level
+-- starts a new round too (change_level), as DF renumbers there as well.
+function rp.note_buffers(vp)
+    local B = rp.bufs
+    local cur = scan.base(vp, 'screentexpos_background')
+    local old = scan.base(vp, 'screentexpos_background_old')
+    local same
+    if old then same = cur ~= nil and cur == B.old and old == B.cur
+    else same = cur ~= nil and cur == B.prev end
+    if not same then
+        B.tail = B.full
+        -- NUMBERS GIVEN AGAIN (1.3.11): see below
+        reset_known()
+        source_round, source_round_at = source_round + 1, dfhack.getTickCount()
+    end
+    B.prev, B.cur, B.old = B.cur, cur, old
+end
+
+-- EMPTY BUFFERS (1.3.11). On a turn of the zoom wheel DF makes its buffers
+-- again, zeroed (THE BUFFERS REMADE), and a frame can come before DF has drawn
+-- anything in them: nothing to tint, no fog to blacken, and DF doesn't show it.
+-- In the trace of 2026-11-27 (1.3.10) a burst of turns at the widest zoom made
+-- 30 such frames in a row, 9 to 11 ms each (the upkeep, the fog walked again
+-- over an empty layer, the full frames the remake called), the lag in a fast
+-- zoom. So a frame whose every level shown has nothing at all in its ground
+-- layer is passed over whole. One C scan a level (diffscan against zeros),
+-- which ends at the first cell drawn: a frame with anything in it costs next
+-- to nothing more. A view of nothing but open air on every level shown is
+-- passed over too, with nothing in it to tint.
+function rp.empty_frame()
+    local gps = df.global.gps
+    local vp = gps.main_viewport
+    local diffscan = dfhack.internal.diffscan
+    if not vp or not diffscan then return false end
+    local dx, dy = vp.dim_x, vp.dim_y
+    local total = dx * dy
+    if total <= 0 then return false end
+    local zeros = scan.zeros(total)
+    -- (a level whose buffer can't be read counts as drawn: nothing is passed over on a guess)
+    local function drawn(port)
+        local base = scan.base(port, 'screentexpos_background')
+        return base == nil or diffscan(zeros, base, 0, total, 4) ~= nil
+    end
+    if drawn(vp) then return false end
+    local lower = gps.lower_viewport
+    for i = 0, LOWER_LEVELS - 1 do
+        local lvp = lower and lower[i]
+        if not lvp or not lvp.flag.active or lvp.dim_x ~= dx or lvp.dim_y ~= dy then break end
+        if drawn(lvp) then return false end
+    end
+    return true
+end
+
+-- HOLD (1.3.10). A tile of ours whose picture changes under a standing view
+-- (DF drew another texture there) is worked out again, and until its new
+-- tint is ready (its picture not read yet, its texture not made, the frame's
+-- work cap reached) it showed DF's own picture: a flash of the bare stone.
+-- Seen with `stone-tint trace` after 1.3.9 (2026-11-27): one frame DF showed
+-- had all 321 tiles of ours waiting (every one with a new texture under it at
+-- once, the cap reached with nothing read), another 81. Now a tile waiting
+-- with every cell still the tile it was (the level, the view's corner and
+-- size, the levels below and DF's textures as the last frame had them: fx.hold)
+-- shows the tint it last had (out, or the one it was already holding: last)
+-- until its new one is ready. A tile that stops being ours (dug out, built
+-- over) isn't waiting, so it is let go at once, as before. A full frame holds
+-- too, from the lists it is about to replace, so a remade buffer or a round
+-- of checks doesn't flash either; a moved view, another level, a new size or
+-- a texture reset holds nothing (a cell is another tile, or the textures held
+-- are gone).
+
 -- A full frame on one level: every cell DF drew there, as before 1.3.6 (the
 -- levels below the same as the level you are on: THE LEVELS BELOW), each one
 -- given something or left waiting written down.
@@ -3615,8 +3797,17 @@ function rp.full_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
     local max_x, max_y = fx.max_x, fx.max_y
     local known, counts = known_texpos, frame_counts
     local lv = level_of(L)
-    local cells, srcs, outs, kinds = lv.cell, lv.src, lv.out, lv.kind
+    local cells, srcs, outs, kinds, lasts = lv.cell, lv.src, lv.out, lv.kind, lv.last
     local n = 0
+    -- HOLD: each listed cell's tint, read before the list is written over
+    local before = nil
+    if fx.hold then
+        before = {}
+        for k = 1, lv.n do
+            local h = outs[k] or lasts[k]
+            if h then before[cells[k]] = h end
+        end
+    end
     local diffscan = dfhack.internal.diffscan
     -- (asked for here, not held from elsewhere: THE ZEROS in onRenderFrame)
     local zeros = diffscan and scan.zeros(total) or nil
@@ -3637,7 +3828,16 @@ function rp.full_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
         end
         if drawn then
             scanned = scanned + 1
-            if known[drawn] ~= false then
+            if known[drawn] == false then
+                -- (THE ZOOM TRACE only) passed over as never ours, though the map
+                -- said the tile was ours when last read (NUMBERS GIVEN AGAIN)
+                if fx.trace then
+                    local sx = cell // dim_y
+                    local col = lchk[win_x + sx]
+                    local c = col and col[win_y + cell - sx * dim_y]
+                    if c and c.id then fx.skipped = fx.skipped + 1 end
+                end
+            else
                 local sx = cell // dim_y
                 local wx = win_x + sx
                 local wy = win_y + cell - sx * dim_y
@@ -3654,13 +3854,23 @@ function rp.full_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
                         cells[n], srcs[n] = cell, drawn
                         outs[n] = after ~= drawn and after or false
                         kinds[n] = kind or false
+                        -- HOLD: waiting, its last tint shown meanwhile
+                        local h = nil
+                        if after == drawn and before then
+                            h = before[cell]
+                            if h then
+                                pbg[cell] = h
+                                this_frame.held = this_frame.held + 1
+                            end
+                        end
+                        lasts[n] = h
                     end
                 end
             end
         end
         cell = cell + 1
     end
-    for k = n + 1, lv.n do cells[k], srcs[k], outs[k], kinds[k] = nil, nil, nil, nil end
+    for k = n + 1, lv.n do cells[k], srcs[k], outs[k], kinds[k], lasts[k] = nil, nil, nil, nil, nil end
     lv.n, lv.changed = n, true
     fx.scanned, fx.below = fx.scanned + scanned, fx.below + below
 end
@@ -3673,20 +3883,24 @@ function rp.quick_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
     local dim_y, win_x, win_y = fx.dim_y, fx.win_x, fx.win_y
     local known, counts = known_texpos, frame_counts
     local lv = level_of(L)
-    local cells, srcs, outs, kinds = lv.cell, lv.src, lv.out, lv.kind
+    local cells, srcs, outs, kinds, lasts = lv.cell, lv.src, lv.out, lv.kind, lv.last
     local n, j, changed, below = lv.n, 0, false, 0
+    local hold = fx.hold
     for i = 1, n do
         local cell = cells[i]
         local v = pbg[cell]
-        local src, out, kind = srcs[i], outs[i], kinds[i]
+        local src, out, kind, last = srcs[i], outs[i], kinds[i], lasts[i]
         local keep = true
         if v == src and out then
             pbg[cell] = out
+            last = nil
         else
             -- Moved on, or still waiting: worked out as a full frame would.
             local new_out = false
             if v == 0 or known[v] == false then
                 keep = false
+                -- (THE ZOOM TRACE only) a tile of ours let go as never ours
+                if fx.trace and v ~= 0 and kind then fx.skipped = fx.skipped + 1 end
             else
                 local sx = cell // dim_y
                 this_frame.pend = false
@@ -3695,20 +3909,30 @@ function rp.quick_level(L, port, pbg, pflags, lz, lcol, lchk, is_lower)
                 local after = pbg[cell]
                 if after ~= v then new_out = after end
                 keep = new_out or this_frame.pend
+                -- HOLD: still waiting, its last tint shown meanwhile
+                if new_out or not this_frame.pend or not hold then
+                    last = nil
+                else
+                    last = out or last
+                    if last then
+                        pbg[cell] = last
+                        this_frame.held = this_frame.held + 1
+                    end
+                end
             end
             if new_out ~= out then changed = true end
             src, out = v, new_out
         end
         if keep then
             j = j + 1
-            cells[j], srcs[j], outs[j], kinds[j] = cell, src, out, kind
+            cells[j], srcs[j], outs[j], kinds[j], lasts[j] = cell, src, out, kind, last
             if out and kind then
                 counts[kind] = counts[kind] + 1
                 if is_lower then below = below + 1 end
             end
         end
     end
-    for k = j + 1, n do cells[k], srcs[k], outs[k], kinds[k] = nil, nil, nil, nil end
+    for k = j + 1, n do cells[k], srcs[k], outs[k], kinds[k], lasts[k] = nil, nil, nil, nil, nil end
     lv.n, lv.changed = j, changed
     fx.scanned, fx.below = fx.scanned + n, fx.below + below
 end
@@ -3789,6 +4013,7 @@ function rp.why_full(z, wx, wy, dx, dy, nl, strength, gmask)
     if z ~= K.z then return 'level' end
     if wx ~= K.wx or wy ~= K.wy then return 'view moved' end
     if dx ~= K.dx or dy ~= K.dy or nl ~= K.nl then return 'view size or levels shown' end
+    if rp.bufs.tail > 0 then return 'buffers remade' end
     if strength ~= K.strength or state.style ~= K.style or state.edges ~= K.edges
             or frame_overlays ~= K.ov or state.faces ~= K.faces or gmask ~= K.gmask then
         return 'settings'
@@ -3811,10 +4036,284 @@ function rp.keep_key(z, wx, wy, dx, dy, nl, strength, gmask)
 end
 end
 
+-- ==========================================
+-- THE ZOOM TRACE (1.3.8)
+-- ==========================================
+-- `stone-tint trace`: for trace.ms, one line a frame into stone-tint-trace.log
+-- in DF's folder, written when the time is up. Made because the tint still went
+-- off and back on with every step of a fast zoom after 1.3.7, flat floors and
+-- all, at the surface and below, which PICTURES BY MEMCMP (renumbered ramps)
+-- cannot account for. What it found: THE BUFFERS REMADE. A frame's tint can
+-- be lost in three places, and each line tells them apart:
+--   * HERE: tiles of ours left showing DF's own picture at the end of the frame
+--     (wait: entries on the quick frames' lists given nothing yet; capped: the
+--     frame's turn-aways by THE FRAME'S WORK CAP), or a frame begun and left
+--     early (calls above 1: onRenderFrame entered more often than it reached
+--     the end since the last line).
+--   * AFTER HERE: anything written into the ground layer between this overlay
+--     and DF showing the frame (Detailed Weather's DLL writes there in its
+--     renderer call, just before display). Each level's ground layer is copied
+--     as the frame ends. At the next frame swap_arrays has made the buffer DF
+--     showed the _old twin, so it is compared with the copy (diffscan): the
+--     changed cells that were ours, how many hold DF's own picture again and
+--     how many something else. A zoom remakes the buffers (reshape_viewports),
+--     so the frame after one has nothing to compare and says remade.
+--   * WITHOUT US: a frame DF drew and showed without this overlay running.
+--     Detailed Weather's DLL, when loaded, counts DF's prerender calls (one per
+--     render_things) and its renderer calls (one per display) in its block
+--     (int64s at +240 and +248, its Block in detailed_weather_dll.cpp). pre and
+--     shown on a line are how far each moved since the line before: 1 and 1,
+--     or 1 and 0 for a frame DF did not show, when nothing was missed.
+-- Nothing of it runs while no trace is on.
+local trace = {on = false, ms = 20000, file = 'stone-tint-trace.log', most = 6000, snaps = {}}
+
+-- Detailed Weather's DLL block (DWHOOK_BLOCK, 'DWHOOK01' at its start), or nil.
+function trace.dw_block()
+    local s = os.getenv('DWHOOK_BLOCK')
+    local base = s and tonumber(s, 16)
+    if not base then return nil end
+    local ok, magic = pcall(function()
+        local m = {}
+        for i = 0, 7 do m[i + 1] = string.char(df.reinterpret_cast('uint8_t', base + i).value) end
+        return table.concat(m)
+    end)
+    return (ok and magic == 'DWHOOK01') and base or nil
+end
+
+-- Its prerender and renderer calls so far, or nil.
+function trace.dw_counts()
+    local b = trace.dw
+    if not b then return nil end
+    local ok, pre, shown = pcall(function()
+        return df.reinterpret_cast('int64_t', b + 240).value, df.reinterpret_cast('int64_t', b + 248).value
+    end)
+    if ok then return pre, shown end
+    return nil
+end
+
+function trace.start()
+    trace.on, trace.t0, trace.last_t, trace.cmp = true, dfhack.getTickCount(), nil, nil
+    trace.lines, trace.calls = {}, 0
+    trace.dw = trace.dw_block()
+    trace.pre, trace.tidy = trace.dw_counts()
+    trace.tot = {frames = 0, wait_frames = 0, wait = 0, capped = 0, early = 0, lost_frames = 0,
+                 lost = 0, to_src = 0, other = 0, remade = 0, missed_pre = 0, missed_shown = 0,
+                 held = 0, skipped_frames = 0, skipped = 0, empty = 0}
+    for _, snap in pairs(trace.snaps) do snap.from = nil end
+end
+
+-- Written out, the copies let go, and the trace off. Nothing is printed: the
+-- command that started it said where the file goes.
+function trace.finish()
+    trace.on = false
+    local T = trace.tot
+    local head = {
+        ('stone-tint trace: %d frames in %d ms; strength %d, style %s, quick frames %s, '
+            .. "Detailed Weather's look at the start %s, its DLL %s"):format(T.frames,
+            (trace.last_t or trace.t0) - trace.t0, state.strength, state.style, rp.on and 'on' or 'off',
+            tostring(trace.look0), trace.dw and 'loaded' or 'not found'),
+        ("ours left showing DF's own picture at the end of a frame: %d frames, %d tiles in all "
+            .. '(%d turn-aways by the work cap); %d more waited on their last tint (HOLD)')
+            :format(T.wait_frames, T.wait, T.capped, T.held),
+        ('frames begun and left before the end: %d'):format(T.early),
+        ('ours changed after us, before DF showed the frame: %d frames, %d tiles '
+            .. "(%d back to DF's own picture, %d to something else)"):format(T.lost_frames, T.lost,
+            T.to_src, T.other),
+        ('frames with nothing to compare, a zoom having remade the buffers: %d'):format(T.remade),
+        ('tiles of ours passed over as a texture never ours (NUMBERS GIVEN AGAIN): %d frames, %d tiles')
+            :format(T.skipped_frames, T.skipped),
+        ('frames passed over, DF having drawn nothing in its buffers yet (EMPTY BUFFERS): %d'):format(T.empty),
+        trace.dw and ('frames DF drew without this overlay: %d; frames DF showed without it: %d')
+            :format(T.missed_pre, T.missed_shown)
+            or "frames DF drew without this overlay: unknown (Detailed Weather's DLL not found)",
+        '',
+        'columns: ms from the start, ms since the line before, frame, full frame and why (or quick), '
+            .. "the view's size, levels below shown, DF's zoom factor, force_full_display_count, the "
+            .. "main ground buffer's address (low 20 bits), Detailed Weather's look, DF's prerender "
+            .. 'and display calls since the line before, onRenderFrame entries since the line before | '
+            .. "this frame's ms, tiles tinted, ours left waiting, of them held on their last tint, "
+            .. "tiles of ours passed over as a texture never ours, "
+            .. "work-cap turn-aways, pictures read, "
+            .. "textures made | the buffer DF showed last frame against what this overlay left in it",
+        '',
+    }
+    local ok, err = pcall(function()
+        local f = assert(io.open(trace.file, 'w'))
+        f:write(table.concat(head, '\n'), '\n', table.concat(trace.lines, '\n'), '\n')
+        f:close()
+    end)
+    if not ok then dfhack.printerr('stone-tint: the trace could not be written: ' .. tostring(err)) end
+    for _, snap in pairs(trace.snaps) do
+        if snap.buf then df.delete(snap.buf) end
+    end
+    trace.snaps, trace.lines = {}, {}
+end
+
+-- A frame passed over as empty (EMPTY BUFFERS): a short line, and counted.
+function trace.empty()
+    local now = dfhack.getTickCount()
+    trace.lines[#trace.lines + 1] = ('%6d +%3d f%-6d empty: nothing drawn in DF\'s buffers yet, passed over')
+        :format(now - trace.t0, trace.last_t and (now - trace.last_t) or 0, frame_id)
+    trace.tot.empty = trace.tot.empty + 1
+    trace.last_t, trace.calls = now, 0
+end
+
+-- Each onRenderFrame entry: counted, and the trace written once its time is up.
+function trace.entry()
+    trace.calls = trace.calls + 1
+    if trace.look0 == nil then trace.look0 = dw_look or false end
+    if dfhack.getTickCount() - trace.t0 >= trace.ms or #trace.lines >= trace.most then trace.finish() end
+end
+
+-- The buffers DF showed last frame (each level's _old twin now) against the
+-- copies taken as that frame ended (trace.keep), for this frame's line.
+function trace.shown(vp, lower, n_lower)
+    local diffscan = dfhack.internal.diffscan
+    local c = {remade = false, ours = 0, lost = 0, to_src = 0, other = 0, changed = 0, ex = nil}
+    local any = false
+    for L, snap in pairs(trace.snaps) do
+        if snap.from then
+            any = true
+            local port = (L == 0 and vp) or (L <= n_lower and lower[L - 1]) or nil
+            local old = port and scan.base(port, 'screentexpos_background_old')
+            if not old or old ~= snap.from or not diffscan then
+                c.remade = true
+            else
+                local now = df.reinterpret_cast('int32_t', old)
+                local mark, total = snap.mark, snap.total
+                c.ours = c.ours + snap.n_ours
+                local i = 0
+                while i < total do
+                    i = diffscan(snap.buf, old, i, total, 4)
+                    if not i then break end
+                    c.changed = c.changed + 1
+                    local src = mark[i]
+                    if src then
+                        c.lost = c.lost + 1
+                        local v = now[i]
+                        if v == src then
+                            c.to_src = c.to_src + 1
+                        else
+                            c.other = c.other + 1
+                            if not c.ex then
+                                c.ex = ('first other: level %d cell %d, ours %d, shown %d, DF drew %d')
+                                    :format(L, i, snap.buf[i], v, src)
+                            end
+                        end
+                    end
+                    i = i + 1
+                end
+            end
+            snap.from = nil
+        end
+    end
+    trace.cmp = any and c or nil
+end
+
+-- One level's ground layer as this frame leaves it, and which cells were ours
+-- (each with the picture DF drew there), for trace.shown next frame.
+function trace.keep(L, port, total)
+    local snap = trace.snaps[L]
+    if not snap then snap = {cap = 0} trace.snaps[L] = snap end
+    local from = port and scan.base(port, 'screentexpos_background')
+    local memmove = dfhack.internal.memmove
+    if not from or not memmove then snap.from = nil return end
+    if snap.cap < total then
+        if snap.buf then df.delete(snap.buf) end
+        snap.buf = df.new('int32_t', total)
+        local _, a = df.sizeof(snap.buf)
+        snap.addr, snap.cap = a, total
+    end
+    memmove(snap.addr, from, total * 4)
+    local mark, n = {}, 0
+    local lv = rp.levels[L]
+    if lv then
+        local cells, srcs, outs = lv.cell, lv.src, lv.out
+        for k = 1, lv.n do
+            if outs[k] then mark[cells[k]] = srcs[k] n = n + 1 end
+        end
+    end
+    snap.from, snap.total, snap.mark, snap.n_ours = from, total, mark, n
+end
+
+-- This frame's line, then each level's ground layer copied for the next frame.
+function trace.frame(vp, lower, n_lower, total, dim_x, dim_y, why, took)
+    local now = dfhack.getTickCount()
+    local T = trace.tot
+    -- the waits left on the quick frames' lists: tiles of ours showing DF's own picture
+    local wait = 0
+    for L = 0, n_lower do
+        local lv = rp.levels[L]
+        if lv then
+            local outs = lv.out
+            for k = 1, lv.n do if not outs[k] then wait = wait + 1 end end
+        end
+    end
+    local tinted = frame_counts[K_FLOOR] + frame_counts[K_STAIR] + frame_counts[K_RAMP] + frame_counts[K_ENGRAVED]
+    local pre, shown = trace.dw_counts()
+    local dpre = pre and trace.pre and (pre - trace.pre)
+    local dshown = shown and trace.tidy and (shown - trace.tidy)
+    trace.pre, trace.tidy = pre, shown
+    local gps = df.global.gps
+    local okz, zf = pcall(function() return gps.viewport_zoom_factor end)
+    local bga = scan.base(vp, 'screentexpos_background') or 0
+    local c = trace.cmp
+    local shown_text
+    if not c then
+        shown_text = 'nothing to compare'
+    elseif c.remade then
+        shown_text = 'remade'
+    else
+        shown_text = ("%d of %d ours changed after us (%d to DF's own, %d other); %d cells changed in all%s")
+            :format(c.lost, c.ours, c.to_src, c.other, c.changed, c.ex and ('; ' .. c.ex) or '')
+    end
+    local held = this_frame.held
+    trace.lines[#trace.lines + 1] = ('%6d +%3d f%-6d %-26s %3dx%-3d L%d zf %s ffd %d buf %05x look %s '
+        .. 'pre %s shown %s calls %d | %5.2f ms tinted %5d wait %5d held %5d skipped %4d capped %4d reads %d '
+        .. 'made %d | %s')
+        :format(now - trace.t0, trace.last_t and (now - trace.last_t) or 0, frame_id, why, dim_x, dim_y,
+            n_lower, okz and tostring(zf) or '?', gps.force_full_display_count or -1, bga & 0xFFFFF,
+            tostring(dw_look), dpre and tostring(dpre) or '?', dshown and tostring(dshown) or '?',
+            trace.calls, took, tinted, wait, held, rp.fx.skipped, this_frame.waited, this_frame.reads,
+            this_frame.made, shown_text)
+    T.frames = T.frames + 1
+    if rp.fx.skipped > 0 then T.skipped_frames, T.skipped = T.skipped_frames + 1, T.skipped + rp.fx.skipped end
+    -- (the waits shown DF's own picture: those not held, HOLD)
+    T.held = T.held + held
+    if wait > held then T.wait_frames, T.wait = T.wait_frames + 1, T.wait + wait - held end
+    T.capped = T.capped + this_frame.waited
+    if trace.calls > 1 then T.early = T.early + trace.calls - 1 end
+    if c and c.remade then
+        T.remade = T.remade + 1
+    elseif c then
+        if c.lost > 0 then T.lost_frames = T.lost_frames + 1 end
+        T.lost, T.to_src, T.other = T.lost + c.lost, T.to_src + c.to_src, T.other + c.other
+    end
+    if dpre and dpre > 1 then T.missed_pre = T.missed_pre + dpre - 1 end
+    if dshown and dshown > 1 then T.missed_shown = T.missed_shown + dshown - 1 end
+    trace.last_t, trace.calls = now, 0
+    -- the copies for the next frame's comparison
+    for L = 0, n_lower do
+        trace.keep(L, L == 0 and vp or lower[L - 1], total)
+    end
+    for L, snap in pairs(trace.snaps) do
+        if L > n_lower then snap.from = nil end
+    end
+end
+
 function StoneTintOverlay:onRenderFrame(dc, rect)
     StoneTintOverlay.super.onRenderFrame(self, dc, rect)
+    -- THE ZOOM TRACE: every entry counted (a frame left early shows as calls
+    -- above 1 on the next line), and the trace written once its time is up.
+    if trace.on then trace.entry() end
 
     if not dfhack.screen.inGraphicsMode() or not dfhack.isMapLoaded() then return end
+    -- EMPTY BUFFERS: nothing drawn in DF's buffers yet, so nothing to do
+    if rp.empty_frame() then
+        rp.empty_n = rp.empty_n + 1
+        if trace.on then trace.empty() end
+        return
+    end
     local started = clock()
     -- Before the strength check, so turning the tint off puts the overlays back.
     -- The shadows go with neither the tint nor its strength (SHADOWS AND FOG).
@@ -3831,8 +4330,8 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     work_until = clock() + WORK_MS / 1000
     this_frame.colours, this_frame.colour_s, this_frame.maps, this_frame.map_s = 0, 0, 0, 0
     this_frame.checks, this_frame.check_s, this_frame.reads, this_frame.read_s = 0, 0, 0, 0
-    this_frame.made, this_frame.made_s, this_frame.waited = 0, 0, 0
-    this_frame.pend = false
+    this_frame.made, this_frame.made_s, this_frame.waited, this_frame.held = 0, 0, 0, 0
+    this_frame.pend, this_frame.first = false, 0
 
     local gps = df.global.gps
     local vp = gps.main_viewport
@@ -3953,11 +4452,22 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     local fx = rp.fx
     fx.total, fx.dim_x, fx.dim_y, fx.win_x, fx.win_y = total, dim_x, dim_y, win_x, win_y
     fx.max_x, fx.max_y, fx.scanned, fx.below = map_max_x, map_max_y, 0, 0
+    rp.note_buffers(vp)   -- (THE BUFFERS REMADE: a new pair calls full frames)
     local why = rp.why_full(z, win_x, win_y, dim_x, dim_y, n_lower, strength, gmask)
+    if rp.bufs.tail > 0 then rp.bufs.tail = rp.bufs.tail - 1 end
     local full = why ~= nil
+    -- HOLD: the last frame's level, corner, size, levels below and textures
+    local V = rp.view
+    -- (THE ZOOM TRACE: tiles passed over as never ours, counted only while it runs)
+    fx.trace, fx.skipped = trace.on, 0
+    fx.hold = V.z == z and V.wx == win_x and V.wy == win_y and V.dx == dim_x and V.dy == dim_y
+        and V.nl == n_lower and V.sentinel == tint_sentinel
+    V.z, V.wx, V.wy, V.dx, V.dy, V.nl, V.sentinel = z, win_x, win_y, dim_x, dim_y, n_lower, tint_sentinel
     if full then rp.why[why] = (rp.why[why] or 0) + 1 end
     local run_level = full and rp.full_level or rp.quick_level
 
+    -- THE ZOOM TRACE: what DF showed of last frame, before this one writes
+    if trace.on then trace.shown(vp, lower, n_lower) end
     local colours, checks = level_caches(z)
     run_level(0, vp, bg, ramp_flags, z, colours, checks, false)
     if edges_on then rp.edges_level(0, vp, bg, z, colours, full) end
@@ -3983,11 +4493,17 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     local took = (clock() - started) * 1000
     stone_tint_stats.frame_ms = timed_average(stone_tint_stats.frame_ms, took)
     stone_tint_stats.worst_ms = math.max(stone_tint_stats.worst_ms or 0, took)
+    -- THE ZOOM TRACE: this frame's line, and its ground layers copied
+    if trace.on then
+        trace.frame(vp, lower, n_lower, total, dim_x, dim_y, full and why or 'quick', took)
+    end
     if full then
         rp.full_n, rp.full_ms = rp.full_n + 1, timed_average(rp.full_ms, took)
     else
         rp.quick_n, rp.quick_ms = rp.quick_n + 1, timed_average(rp.quick_ms, took)
     end
+    rp.held_n = rp.held_n + this_frame.held
+    rp.first_n = rp.first_n + this_frame.first
     add_cost('materials', this_frame.colours, this_frame.colour_s)
     add_cost('maps', this_frame.maps, this_frame.map_s)
     add_cost('looks', this_frame.checks, this_frame.check_s)
@@ -4291,6 +4807,11 @@ function stone_tint_command(...)
             .. 'record %d times, walked again %d; the fog below kept %d frames, walked %d')
             :format(#listed > 0 and table.concat(listed, ', ') or 'none', rp.edges_kept,
             rp.edges_redone, rp.fog.kept, rp.fog.walked))
+        print(('stone-tint: since last status, tiles kept on their last tint while their new picture '
+            .. 'waited (HOLD): %d; frames passed over, nothing drawn in DF\'s buffers yet (EMPTY BUFFERS): %d;'
+            .. ' texture numbers read past the work cap to be filed (FILED FIRST): %d')
+            :format(rp.held_n, rp.empty_n, rp.first_n))
+        rp.held_n, rp.empty_n, rp.first_n = 0, 0, 0
         rp.quick_n, rp.full_n, rp.why, rp.edges_kept, rp.edges_redone = 0, 0, {}, 0, 0
         rp.fog.kept, rp.fog.walked = 0, 0
         stats.worst_ms, stats.upkeep_worst_ms = 0, 0
@@ -4336,6 +4857,13 @@ function stone_tint_command(...)
         else qerror('replay must be on or off') end
         rp.key.valid, rp.fog.valid = false, false
         print(('stone-tint: quick frames %s'):format(rp.on and 'on' or 'off: every frame is a full frame'))
+    elseif args[1] == 'trace' then
+        -- THE ZOOM TRACE: started here, written by the frames once its time is up.
+        if trace.on then qerror('stone-tint: a trace is already running') end
+        trace.look0 = nil
+        trace.start()
+        print(('stone-tint: tracing the next %d seconds into %s in DF\'s folder, written when the time '
+            .. 'is up; zoom in and out fast over tinted stone now'):format(trace.ms // 1000, trace.file))
     else
         print('Use: stone-tint [gui]')
         print('     overlay enable stone-tint.map')
@@ -4346,6 +4874,7 @@ function stone_tint_command(...)
         print('     stone-tint style <keep|smooth|classic>')
         print('     stone-tint edges <smart|simple|off>')
         print('     stone-tint replay <on|off>')
+        print('     stone-tint trace')
     end
 end
 
