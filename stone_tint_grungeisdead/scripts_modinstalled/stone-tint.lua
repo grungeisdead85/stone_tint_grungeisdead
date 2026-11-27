@@ -1795,11 +1795,18 @@ end
 -- vanilla's RAMP_OVERLAY and Dark Depths' DARK_RAMP_OVERLAY pages were hidden
 -- by name, Detailed Landscapes' was left shown over the tint, and any other
 -- graphics' left alone. Hiding is global, so every ramp stone-tint sees gets
--- its overlay drawn in: the ones it does not tint (grass, sand, constructed, a
--- switch off) as drawn, as DF would show them. "Ramp overlays" in the window:
+-- its overlay drawn in: the ones it does not tint (sand, constructed, a switch
+-- off) as drawn, as DF would show them. "Ramp overlays" in the window:
 -- Tinted (drawn in, the default), Hidden (drawn nowhere, as "Hide ramp
 -- overlays" did) or As drawn (left to DF, over the tint). The shadows are
 -- other tokens and are left alone.
+-- GRASS RAMPS LEFT AS DRAWN (1.3.14): but not a grass ramp. Drawn into one as
+-- drawn, the overlay lay over the hills' grass as flat grey slabs under
+-- Tinted, while Hidden, with nothing drawn into them, showed the hills rounded
+-- (seen in play 2026-11-27, the three settings side by side; on stone ramps
+-- only Tinted showed their shading). So a grass ramp is now never ours (WHAT A
+-- TILE IS) and keeps DF's own picture, as under Hidden, and Tinted gives both:
+-- stone and soil ramps shaded, grass hills rounded.
 --
 -- The blank is a RESERVED texture: these entries hold raw texposes, not
 -- handles, and the dynamic range gets wiped and renumbered. The entries and
@@ -2400,11 +2407,12 @@ end
 -- What a tile is to stone-tint, read off the map (TILES BY THE MAP): an art id
 -- for a revealed natural floor (or a boulder's tile), stair or ramp of stone,
 -- or of soil that is not sand; ENGRAVED for a natural stone floor with an
--- engraving on it; RAMP_OTHER for any other ramp (it gets its overlay: RAMP
--- OVERLAYS); false for anything else. The second value is true when no picture
--- DF draws on a tile like this one is ever ours: a wall, a fortification, open
--- space, a ramp's top, or grass (but for a grass ramp), which DF draws in
--- pictures of its own. A tile
+-- engraving on it; RAMP_OTHER for any other ramp but a grass one (it gets its
+-- overlay: RAMP OVERLAYS); false for anything else. The second value is true
+-- when no picture DF draws on a tile like this one is ever ours: a wall, a
+-- fortification, open space, a ramp's top, or grass, a grass ramp included
+-- (GRASS RAMPS LEFT AS DRAWN, 1.3.14), which DF draws in pictures of its own.
+-- A tile
 -- under a shrub, a sapling or a construction is only false: the picture there
 -- may be a floor's that is ours elsewhere. flag is the tile's
 -- screentexpos_ramp_flag, which picks a ramp's cell. Map reads, so the render
@@ -2426,8 +2434,8 @@ tile_kind = function(x, y, z, flag)
     if not b then return false, false end
     local idx = (x & 15) * 16 + (y & 15)
     local material, tshape, special = tile_attrs(b.tt[idx])
-    -- (a grass ramp still gets its overlay: RAMP_OTHER, below)
-    if NEVER_SHAPES[tshape] or (NEVER_MATERIALS[material] and tshape ~= RAMP) then
+    -- (a grass ramp too: GRASS RAMPS LEFT AS DRAWN, at RAMP OVERLAYS; until 1.3.14 it got its overlay)
+    if NEVER_SHAPES[tshape] or NEVER_MATERIALS[material] then
         return false, material ~= M_TREE and (tshape == S.WALL or NEVER_MATERIALS[material] ~= nil)
     end
     local stair = STAIR_SHAPES[tshape]
