@@ -386,11 +386,8 @@ local this_frame = {
     waited = 0,                    -- tiles left for a later frame by the cap
     -- (1.3.6, THE QUICK FRAMES) pend: set by paint_cell when it left a tile for
     -- a later frame (no time left, a picture not read yet, a texture not made
-    -- yet), so the tile stays on the quick frames' list and is tried again;
-    -- checks_put_off: picture checks put off for want of this frame's checks,
-    -- so another full frame follows until the round of checks is through.
+    -- yet), so the tile stays on the quick frames' list and is tried again.
     pend = false,
-    checks_put_off = 0,
 }
 
 -- ==========================================
@@ -1283,8 +1280,6 @@ local function source_for(texpos)
     if s then
         if frame_checks <= 0 then
             waiting[texpos] = frame_id
-            -- (THE QUICK FRAMES) a check put off: this round isn't through yet
-            this_frame.checks_put_off = this_frame.checks_put_off + 1
             return s.id
         end
         frame_checks = frame_checks - 1
@@ -3489,9 +3484,15 @@ end
 --     moved (why_full): the view, the level, the view's size or the levels
 --     below shown, a setting (strength, style, edges, ramp overlays, faces,
 --     the switches), DF's textures (the sentinel), DF's own pieces read again
---     (tokens.gen), Detailed Weather's look, the engravings, a new round of
---     picture checks (until every check is through), and every FULL_EVERY
---     frames regardless.
+--     (tokens.gen), Detailed Weather's look, the engravings, and every
+--     FULL_EVERY frames regardless.
+--   * Not a new round of picture checks (THE ART AS DRAWN, every
+--     SOURCE_CHECK_MS): the full frame every FULL_EVERY frames runs a
+--     round's checks, as every full frame does (paint_cell asks source_for),
+--     so a picture changed under the same number is seen within FULL_EVERY - 1
+--     frames. Measured in play (2026-11-26): the rounds, until all their
+--     checks were through, had called half of all full frames (220 of 430,
+--     271 of 549), each about 5 ms against a quick frame's 0.3 to 0.4.
 -- What a quick frame cannot see is a tile that was not ours becoming ours
 -- while the view stands still (a wall dug out, a floor revealed): DF draws
 -- it, and it waits for the next full frame, at most FULL_EVERY - 1 frames,
@@ -3719,7 +3720,6 @@ function rp.why_full(z, wx, wy, dx, dy, nl, strength, gmask)
     if tint_sentinel ~= K.sentinel or tokens.gen ~= K.tokens then return 'textures' end
     if dw_look ~= K.look then return 'weather look' end
     if engravings.count ~= K.eng then return 'engravings' end
-    if source_round ~= K.round or K.checks then return 'picture checks' end
     if frame_id - K.frame >= FULL_EVERY then return 'every 8 frames' end
     return nil
 end
@@ -3730,9 +3730,7 @@ function rp.keep_key(z, wx, wy, dx, dy, nl, strength, gmask)
     K.valid, K.z, K.wx, K.wy, K.dx, K.dy, K.nl = true, z, wx, wy, dx, dy, nl
     K.strength, K.style, K.edges, K.ov, K.faces, K.gmask =
         strength, state.style, state.edges, frame_overlays, state.faces, gmask
-    K.sentinel, K.tokens, K.look, K.eng, K.round =
-        tint_sentinel, tokens.gen, dw_look, engravings.count, source_round
-    K.checks = this_frame.checks_put_off > 0
+    K.sentinel, K.tokens, K.look, K.eng = tint_sentinel, tokens.gen, dw_look, engravings.count
     K.frame = frame_id
 end
 end
@@ -3758,7 +3756,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     this_frame.colours, this_frame.colour_s, this_frame.maps, this_frame.map_s = 0, 0, 0, 0
     this_frame.checks, this_frame.check_s, this_frame.reads, this_frame.read_s = 0, 0, 0, 0
     this_frame.made, this_frame.made_s, this_frame.waited = 0, 0, 0
-    this_frame.pend, this_frame.checks_put_off = false, 0
+    this_frame.pend = false
 
     local gps = df.global.gps
     local vp = gps.main_viewport
