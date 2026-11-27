@@ -127,7 +127,7 @@ local ART_COUNT = #ART_CELL
 -- ==========================================
 -- (v1.2.0, 2026-11-21) Which tiles are tinted is read off the map, never off
 -- a tile page: a revealed natural tile of stone (STONE, MINERAL, FEATURE,
--- LAVA_STONE) or soil (SOIL, sand excepted), shaped as a floor (a boulder's
+-- LAVA_STONE) or soil (SOIL, sand too: SAND TINTED), shaped as a floor (a boulder's
 -- tile too: DF draws its floor under it), a stair or a ramp (WHAT A TILE IS).
 -- Whatever picture DF drew in that tile's ground layer is tinted (THE ART AS
 -- DRAWN), whichever graphics drew it: vanilla's, Detailed Landscapes', Detailed
@@ -135,6 +135,13 @@ local ART_COUNT = #ART_CELL
 -- and engraved floors were found by their tile pages, by name (FLOORS,
 -- ALT_FLOORS, DETAILED_FLOORS, FLOORS_ROUND_DETAILED and the two engraved
 -- floor pages), so graphics drawing them off any other page went untinted.
+--
+-- SAND TINTED (1.3.15): sand is tinted as the soil it is to the map, its
+-- floors, stairs and ramps in its own colour, under the soil switches, and the
+-- edge pieces it drops with them (FLOOR EDGES: edgings 3 to 7). Until 1.3.15
+-- it was left as DF drew it (v1.2.0 to 1.3.14 excepted it here, by
+-- is_sand), on the grounds that DF draws sand with art of its own; wanted
+-- tinted in play 2026-11-27, Detailed Landscapes' sand colours being washed out.
 --
 -- A floor is rough, smooth (tiletype special SMOOTH) or engraved (smooth, with
 -- an engraving on its floor), each with its own switch. The art id a kind gets
@@ -208,8 +215,9 @@ local STONE_MATERIALS = {
     [df.tiletype_material.FEATURE] = true,
     [df.tiletype_material.LAVA_STONE] = true,
 }
--- What any other ramp is (grass, sand, a construction, ice): not tinted, but
--- given its overlay (RAMP OVERLAYS).
+-- What any other ramp is (a construction, ice): not tinted, but given its
+-- overlay (RAMP OVERLAYS). A grass ramp is never ours (GRASS RAMPS LEFT AS
+-- DRAWN, 1.3.14); a sand ramp is tinted as soil (SAND TINTED, 1.3.15).
 local RAMP_OTHER = -3
 
 -- ==========================================
@@ -319,20 +327,24 @@ local edge = {
     count = 0,      -- open cells given tinted edges this frame, for `stone-tint status`
     modes = {{'smart', 'Smart'}, {'simple', 'Simple'}, {'off', 'Off'},
              smart=true, simple=true, off=true},
-    sources = {},   -- [z][wx][wy] = 9 (stone), 2 (soil), or false: map fallback for off-screen/overhang floors
+    sources = {},   -- [z][wx][wy] = 9 (stone), 8 (pebbles), 2 (soil), 3 (sand, SAND_EDGE) or false: map fallback for off-screen/overhang floors
     fallback = {},  -- code -> {code=, under=false} reused across frames
     piece_px = {},  -- [sid][code] = flat {j, abgr, ...} pre-tinted opaque pixels for one edge piece
     floor_px = {},  -- [sid][code] = 1024 pre-tinted floor pixels for smart edge baking
 }
 -- DF'S OWN PIECES AND OVERLAYS (below): what DF draws a floor's edge pieces
 -- and a ramp's overlay from, found in the graphics raws by token.
--- stone[1 to 9], soil[1 to 9]: the texposes of STONE_FLOOR_1 to 9 and
--- DIRT_FLOOR_1 to 9; overlay[case]: of OVERLAY_RAMP_WITH_WALL_* and
+-- stone[1 to 9], soil[1 to 9], pebbles[1 to 9]: the texposes of STONE_FLOOR_1
+-- to 9, DIRT_FLOOR_1 to 9 and PEBBLES_FLOOR_1 to 9; sand, sand_yellow,
+-- sand_white, sand_black and sand_red[1 to 9]: of SAND_FLOOR_1 to 9,
+-- SAND_YELLOW_FLOOR_1 to 9 and so on (SAND TINTED); overlay[case]: of
+-- OVERLAY_RAMP_WITH_WALL_* and
 -- OVERLAY_RAMP_OTHER, by the walls' case (case_of_walls); overlay_set: each
 -- overlay's texpos -> true; checks: {page, x, y, texpos} for each, to notice
 -- DF moving them; rehide: the overlays to be found again; dirs, files, found:
 -- what was read, for `stone-tint status`.
 local tokens = {stone = {}, soil = {}, pebbles = {}, overlay = {}, overlay_set = {}, checks = {},
+                sand = {}, sand_yellow = {}, sand_white = {}, sand_black = {}, sand_red = {},
                 dirs = 0, files = 0, found = 0}
 -- THE OVERLAY IN THE RAMP (below): made[sid][ov][code] = the texpos of a ramp's
 -- picture with its overlay laid in, or false (code 0: as drawn); laid: ramps
@@ -926,8 +938,10 @@ local function lookup_colour(x, y, z)
     return code
 end
 
--- Sand is soil to the map, but DF draws it with art of its own (sand floors,
--- stairs and ramps), so it keeps that look. Cached per geolayer so panning
+-- Sand is soil to the map, with art of its own (sand floors, stairs and
+-- ramps) and edge pieces of its own (FLOOR EDGES). Until 1.3.15 it kept DF's
+-- look by this test; it is tinted now (SAND TINTED), and this only tells the
+-- edges that a floor drops sand's pieces. Cached per geolayer so panning
 -- across sand surfaces costs zero tile-material calls per tile.
 local function is_sand(x, y, z)
     local b = fast.block(x, y, z)
@@ -1556,7 +1570,10 @@ end
 --     and edging 2 (EDGING_SOIL) from dirt_floor_texpos[0], at the side's
 --     piece (S 2, W 6, E 4, N 8; the corners SE 1, SW 3, NE 7, NW 9): the
 --     STONE_FLOOR_1 to 9 and DIRT_FLOOR_1 to 9 tokens, the same pieces
---     whichever floor drops them;
+--     whichever floor drops them. Edgings 3 to 7 (SAND TINTED, 1.3.15) are
+--     sand's, from texpos_floor_sand, _yellow, _white, _black and _red (the
+--     order of graphics.h's EdgingType): SAND_FLOOR_1 to 9,
+--     SAND_YELLOW_FLOOR_1 to 9 and so on; 8 is pebbles', PEBBLES_FLOOR_1 to 9;
 --   * a ramp's overlay (RAMP OVERLAYS).
 -- Which pictures those tokens hold is read from the graphics raws, so no page
 -- is named here and whichever graphics are installed are followed: every
@@ -1603,12 +1620,15 @@ local function overlay_case(token)
     for _, name in ipairs(CASE_ORDER) do if has[name] then keep[#keep + 1] = name end end
     return #keep > 0 and table.concat(keep, ' ') or nil
 end
--- The pieces' tokens: {'stone', n}, {'soil', n} and {'pebbles', n}.
+-- The pieces' tokens: {'stone', n}, {'soil', n}, {'pebbles', n}, and each
+-- sand colour's (SAND TINTED): {'sand', n}, {'sand_yellow', n} and so on.
+-- PIECE_FAMILIES: each set's name (its table in tokens) and its tokens' prefix.
 local PIECE_TOKENS = {}
-for n = 1, 9 do
-    PIECE_TOKENS['STONE_FLOOR_' .. n] = {'stone', n}
-    PIECE_TOKENS['DIRT_FLOOR_' .. n] = {'soil', n}
-    PIECE_TOKENS['PEBBLES_FLOOR_' .. n] = {'pebbles', n}
+local PIECE_FAMILIES = {stone = 'STONE_FLOOR_', soil = 'DIRT_FLOOR_', pebbles = 'PEBBLES_FLOOR_',
+    sand = 'SAND_FLOOR_', sand_yellow = 'SAND_YELLOW_FLOOR_', sand_white = 'SAND_WHITE_FLOOR_',
+    sand_black = 'SAND_BLACK_FLOOR_', sand_red = 'SAND_RED_FLOOR_'}
+for family, prefix in pairs(PIECE_FAMILIES) do
+    for n = 1, 9 do PIECE_TOKENS[prefix .. n] = {family, n} end
 end
 
 -- A loaded page's texpos at cell x, y, or nil.
@@ -1741,7 +1761,8 @@ refresh_tokens = function(force)
     local ok, defs, dirs, files = pcall(read_raws)
     if not ok then defs, dirs, files = {}, 0, 0 end
     local values = next(defs) and table_values() or {}
-    local stone, soil, pebbles, overlay, overlay_set, checks, found = {}, {}, {}, {}, {}, {}, 0
+    local pieces, overlay, overlay_set, checks, found = {}, {}, {}, {}, 0
+    for family in pairs(PIECE_FAMILIES) do pieces[family] = {} end
     for token, list in pairs(defs) do
         local pick = list[#list]
         if not values[pick.t] then
@@ -1751,7 +1772,7 @@ refresh_tokens = function(force)
         end
         local piece = PIECE_TOKENS[token]
         if piece then
-            (piece[1] == 'stone' and stone or piece[1] == 'soil' and soil or pebbles)[piece[2]] = pick.t
+            pieces[piece[1]][piece[2]] = pick.t
         else
             overlay[overlay_case(token)] = pick.t
             overlay_set[pick.t] = true
@@ -1759,8 +1780,8 @@ refresh_tokens = function(force)
         found = found + 1
         checks[#checks + 1] = {pick.page, pick.x, pick.y, dfhack.screen.findGraphicsTile(pick.page, pick.x, pick.y)}
     end
-    tokens.stone, tokens.soil, tokens.pebbles, tokens.overlay, tokens.overlay_set =
-        stone, soil, pebbles, overlay, overlay_set
+    for family, set in pairs(pieces) do tokens[family] = set end
+    tokens.overlay, tokens.overlay_set = overlay, overlay_set
     tokens.checks, tokens.dirs, tokens.files, tokens.found = checks, dirs, files, found
     -- the overlays hidden under the old textures are put back and hidden again under the
     -- new ones (update_ramp_overlays); the pieces and overlays drawn from the old go
@@ -1795,9 +1816,10 @@ end
 -- vanilla's RAMP_OVERLAY and Dark Depths' DARK_RAMP_OVERLAY pages were hidden
 -- by name, Detailed Landscapes' was left shown over the tint, and any other
 -- graphics' left alone. Hiding is global, so every ramp stone-tint sees gets
--- its overlay drawn in: the ones it does not tint (sand, constructed, a switch
--- off) as drawn, as DF would show them. "Ramp overlays" in the window:
--- Tinted (drawn in, the default), Hidden (drawn nowhere, as "Hide ramp
+-- its overlay drawn in: the ones it does not tint (constructed, ice, a switch
+-- off; sand until 1.3.15, SAND TINTED) as drawn, as DF would show them.
+-- "Ramp overlays" in the window: Tinted (drawn in, the default), Hidden
+-- (drawn nowhere, as "Hide ramp
 -- overlays" did) or As drawn (left to DF, over the tint). The shadows are
 -- other tokens and are left alone.
 -- GRASS RAMPS LEFT AS DRAWN (1.3.14): but not a grass ramp. Drawn into one as
@@ -2406,7 +2428,7 @@ end
 -- ==========================================
 -- What a tile is to stone-tint, read off the map (TILES BY THE MAP): an art id
 -- for a revealed natural floor (or a boulder's tile), stair or ramp of stone,
--- or of soil that is not sand; ENGRAVED for a natural stone floor with an
+-- or of soil, sand included (SAND TINTED); ENGRAVED for a natural stone floor with an
 -- engraving on it; RAMP_OTHER for any other ramp but a grass one (it gets its
 -- overlay: RAMP OVERLAYS); false for anything else. The second value is true
 -- when no picture DF draws on a tile like this one is ever ours: a wall, a
@@ -2442,7 +2464,7 @@ tile_kind = function(x, y, z, flag)
     if not (stair or tshape == RAMP or FLOOR_LIKE[tshape]) then return false, false end
     if (b.des[idx] & fast.m_hidden) ~= 0 then return false, false end
     local family = STONE_MATERIALS[material] and 'stone' or (material == MAT_SOIL and 'soil') or nil
-    if family == 'soil' and is_sand(x, y, z) then family = nil end
+    -- (sand is soil here: SAND TINTED, 1.3.15; until then it was left as DF drew it)
     if not family then return tshape == RAMP and RAMP_OTHER or false, false end
     if stair then return STAIR_ART[family][stair], false end
     if tshape == RAMP then
@@ -2901,7 +2923,8 @@ end
 -- ==========================================
 -- A floor's art is a 3x3 set: the floor itself in the middle (piece 5, or 5B
 -- to 5D) and eight small pieces round it that hang over its edges into the
--- next cells (STONE_FLOOR_1 to 9, DIRT_FLOOR_1 to 9 for soil). Where a floor
+-- next cells (STONE_FLOOR_1 to 9, DIRT_FLOOR_1 to 9 for soil, SAND_FLOOR_1 to
+-- 9 and its colours' for sand). Where a floor
 -- meets open ground (a channel, a ramp's top, a cliff) DF draws those pieces
 -- on the open cell in the art's own colours, so every tinted floor kept a grey
 -- lip round a channel (seen in play 2026-11-15).
@@ -2928,15 +2951,16 @@ end
 -- more). So every cell DF draws on a level is looked at, whatever its own
 -- background, whenever that level has floors of ours.
 --
--- So on every cell with edging, each side with stone or soil edging (9, 2)
+-- So on every cell with edging, each side with stone, pebble, soil or sand
+-- edging (9, 8, 2, and 3 to 7: SAND TINTED)
 -- whose floor stone-tint tinted this frame gets the piece DF draws there (DF'S
 -- OWN PIECES AND OVERLAYS: since v1.2 by token, the same pieces whichever
 -- graphics fill them; until v1.1 from the floor's own page, by name), tinted as
 -- the floor is (keep moves it by the floor's own shift), and each corner
--- between two sides carrying the same stone or soil edging, one of them ours,
+-- between two sides carrying the same one of those edgings, one of them ours,
 -- gets that corner's piece in the diagonal floor's tint (a side's, when the
--- diagonal is not one of ours). Edging of any other kind (grass, sand,
--- pebbles) is left as DF draws it. Corners
+-- diagonal is not one of ours). Edging of any other kind (grass) is left as
+-- DF draws it. Corners
 -- were measured only where both sides held 9; where the two sides hold
 -- different IDs (a grass edge beside a stone one) what DF draws is not known,
 -- so no corner is added there. The pieces are stacked into
@@ -2978,13 +3002,25 @@ local p_sid, p_code, p_fsid, parts = {}, {}, {}, {}
 
 -- The pieces by edging ID: DF's own (DF'S OWN PIECES AND OVERLAYS), and the
 -- art id of our stored copy of piece 1 (for a picture that cannot be read).
-local EDGINGS = {[9] = {'stone', 1}, [8] = {'pebbles', 1}, [2] = {'soil', FIRST_SOIL_FLOOR}}
+-- 3 to 7 are sand's (SAND TINTED, 1.3.15), one per sand colour in the order
+-- of DF's EdgingType (g_src graphics.h: SOIL_SAND, then its YELLOW, WHITE,
+-- BLACK and RED); a sand piece that cannot be read falls back to our stored
+-- copy of soil's, which the floor's tint recolours anyway.
+local EDGINGS = {[9] = {'stone', 1}, [8] = {'pebbles', 1}, [2] = {'soil', FIRST_SOIL_FLOOR},
+    [3] = {'sand', FIRST_SOIL_FLOOR}, [4] = {'sand_yellow', FIRST_SOIL_FLOOR},
+    [5] = {'sand_white', FIRST_SOIL_FLOOR}, [6] = {'sand_black', FIRST_SOIL_FLOOR},
+    [7] = {'sand_red', FIRST_SOIL_FLOOR}}
+local EDGE_IDS = {9, 8, 2, 3, 4, 5, 6, 7}
+-- What edge_source gives for a sand floor. Which sand edging DF gives a sand
+-- floor goes by its colour, so a sand floor is taken as dropping any of them.
+local SAND_EDGE = 3
+local SAND_EDGINGS = {[3] = true, [4] = true, [5] = true, [6] = true, [7] = true}
 
 -- Per-frame resolved edge piece sources and canonical piece-5 floor shift
 -- sources, so add_piece never calls dw_shown/source_for per cell and keeps one
 -- canonical shift per edging family instead of multiplying by every floor/pebble variant.
-local surf_sid = {[9] = {}, [8] = {}, [2] = {}}
-local under_sid = {[9] = {}, [8] = {}, [2] = {}}
+local surf_sid, under_sid = {}, {}
+for _, id in ipairs(EDGE_IDS) do surf_sid[id], under_sid[id] = {}, {} end
 local surf_fsid, under_fsid = {}, {}
 local resolved_frame = -1
 local stored_mean, stored_opaque = {}, {}
@@ -2993,7 +3029,7 @@ local function resolve_edge_pieces()
     resolved_frame = frame_id
     local dw_on = dw_memo.active
     local pending = false
-    for _, id in ipairs({9, 8, 2}) do
+    for _, id in ipairs(EDGE_IDS) do
         local e = EDGINGS[id]
         local tk, base = tokens[e[1]], e[2]
         local ss, us = surf_sid[id], under_sid[id]
@@ -3252,7 +3288,8 @@ local ROUGH_SPECIALS = {
 
 -- Map-level fallback for a rough floor at (wx, wy, z) when it isn't in
 -- edge.info (1 tile off-screen or hidden under a shaft overhang).
--- Returns 9 (stone), 8 (pebbles), 2 (soil), or false.
+-- Returns 9 (stone), 8 (pebbles), 2 (soil), SAND_EDGE (sand: SAND TINTED),
+-- or false.
 local function edge_source(wx, wy, z)
     local b = fast.block(wx, wy, z)
     if not b then return false end
@@ -3266,7 +3303,7 @@ local function edge_source(wx, wy, z)
         or (material == MAT_SOIL and 2) or false
     if not id then return false end
     if (b.des[idx] & fast.m_hidden) ~= 0 then return false end
-    if id == 2 and is_sand(wx, wy, z) then return false end
+    if id == 2 and is_sand(wx, wy, z) then return SAND_EDGE end
     return id
 end
 
@@ -3285,7 +3322,8 @@ local function map_floor_info(wx, wy, z, id, colours)
         scol[wy] = src_id
         this_frame.maps, this_frame.map_s = this_frame.maps + 1, this_frame.map_s + clock() - t0
     end
-    if src_id ~= id then return false end
+    -- (a sand floor drops whichever sand edging DF gave its colour: SAND_EDGE)
+    if src_id ~= id and not (src_id == SAND_EDGE and SAND_EDGINGS[id]) then return false end
     local col = colours[wx]
     if not col then col = {} colours[wx] = col end
     local code = col[wy]
