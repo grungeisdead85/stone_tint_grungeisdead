@@ -34,10 +34,8 @@ local STRENGTHS = {0, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100}
 -- each value as a key, to check a saved or typed one.
 local TINT_STYLES = {{'keep', 'Keep texture'}, {'smooth', 'Smooth'}, {'classic', 'Classic'},
     keep=true, smooth=true, classic=true}
--- What "Ramp overlays" can be (RAMP OVERLAYS), in the window's order as
--- {value, label}, and each value as a key.
-local OVERLAY_MODES = {{'tinted', 'Tinted'}, {'hidden', 'Hidden'}, {'shown', 'As drawn'},
-    tinted=true, hidden=true, shown=true}
+-- ("Ramp overlays", Tinted / Hidden / As drawn, is gone since 1.3.16: OVERLAYS
+-- LEFT TO DF, at RAMP OVERLAYS.)
 local GLOBAL_KEY = 'stone-tint'
 local CELL_PX = 32
 -- New textures made per frame at most. The first sight of a material makes one
@@ -275,8 +273,9 @@ local color_cache = {}          -- [z] = {[world_x] = {[world_y] = colour code}}
 -- picture changes.
 local tile_checks = {}
 local map_max_x, map_max_y      -- tile bounds, refreshed on map load
-local state = {strength=50, style='keep', rough=true, smooth=true, stairs=true, ramps=true, soil=true,
-               overlays='hidden', engraved=true, faces=true, black_shadows=true, edges='smart'}
+-- (strength 100 by default since 1.3.16; a fort keeps whatever it saved)
+local state = {strength=100, style='keep', rough=true, smooth=true, stairs=true, ramps=true, soil=true,
+               engraved=true, faces=true, black_shadows=true, edges='smart'}
 local view
 
 -- Running stone-tint from the console re-executes this whole file in the same
@@ -1822,6 +1821,20 @@ end
 -- (drawn nowhere, as "Hide ramp
 -- overlays" did) or As drawn (left to DF, over the tint). The shadows are
 -- other tokens and are left alone.
+-- OVERLAYS LEFT TO DF (1.3.16): all of the above is undone. DF's overlays are
+-- never hidden now and the setting is gone. Detailed Landscapes' overlay is
+-- opaque, so laid into a ramp it covered the ramp's own art and came out as
+-- one flat colour in a rounded shape (Tinted); and hiding it in DF's shared
+-- tables took it from every ramp, ours or not, so constructed ramps lost
+-- their shape and showed flat floor art (Hidden). As drawn did not bring it
+-- back within a session: DF builds its ramp pictures when the map loads and
+-- does not rebuild them when the tables change. Loaded with nothing hidden
+-- (As drawn, then a restart; seen in play 2026-11-27), every ramp looked
+-- right: wood ramps rounded, grass ramps as Detailed Landscapes draws them,
+-- and our tinted stone ramps with nothing drawn over them. So stone-tint now
+-- only tints its own ramps, with no overlay of anyone's in them, and leaves
+-- DF's overlays alone; update_ramp_overlays only puts back any an older copy
+-- hid in this session, and THE OVERLAY IN THE RAMP is no longer reached.
 -- GRASS RAMPS LEFT AS DRAWN (1.3.14): but not a grass ramp. Drawn into one as
 -- drawn, the overlay lay over the hills' grass as flat grey slabs under
 -- Tinted, while Hidden, with nothing drawn into them, showed the hills rounded
@@ -1926,7 +1939,8 @@ local function refresh_overlays(blank)
 end
 function update_ramp_overlays()
     local ov = stone_tint_overlays
-    local want = art ~= nil and state.strength > 0 and state.ramps and state.overlays ~= 'shown'
+    -- (OVERLAYS LEFT TO DF, 1.3.16) never hidden: any still hidden are put back
+    local want = false
     -- (DF'S OWN PIECES AND OVERLAYS read again: hidden again under the textures found now)
     if tokens.rehide then
         tokens.rehide = false
@@ -2498,9 +2512,7 @@ local function load_state()
     for _, k in ipairs({'rough', 'smooth', 'stairs', 'ramps', 'soil', 'black_shadows', 'engraved', 'faces'}) do
         if saved[k] ~= nil then state[k] = saved[k] end
     end
-    -- (v1.2) "Ramp overlays", in place of "Hide ramp overlays": a save from before
-    -- v1.2 has none, and takes the default (hidden).
-    if OVERLAY_MODES[saved.overlays] then state.overlays = saved.overlays end
+    -- (a saved "overlays" from before 1.3.16 is ignored: OVERLAYS LEFT TO DF)
     if edge.modes[saved.edges] then state.edges = saved.edges end
 end
 
@@ -4465,7 +4477,8 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     frame_strength, frame_budget = strength, NEW_TEXTURES_PER_FRAME
     -- THE OVERLAY IN THE RAMP: only while DF's overlays are hidden, any found
     local ov = stone_tint_overlays
-    frame_overlays = state.overlays == 'tinted' and ov.hidden and ov.slots ~= nil and #ov.slots > 0
+    -- (OVERLAYS LEFT TO DF, 1.3.16: never; until then while Tinted and DF's were hidden)
+    frame_overlays = false
     ramp.laid = 0
     local total = dim_x * dim_y
     -- THE ZEROS, sized for the whole frame up front (the floor flags take two
@@ -4658,8 +4671,6 @@ function TintWindow:init()
     end
     local style_options = {}
     for i, st in ipairs(TINT_STYLES) do style_options[i] = {label=st[2], value=st[1]} end
-    local overlay_options = {}
-    for i, m in ipairs(OVERLAY_MODES) do overlay_options[i] = {label=m[2], value=m[1]} end
     self:addviews{
         widgets.Label{text='Tint strength:'},
         widgets.CycleHotkeyLabel{
@@ -4690,16 +4701,6 @@ function TintWindow:init()
         -- Soil rides on the switches above: a soil floor, stair or ramp needs
         -- this and the switch for its shape.
         toggle('Include soil:', 'CUSTOM_O', 'soil'),
-        -- DF's ramp overlays (RAMP OVERLAYS): drawn into every ramp, tinted with
-        -- the tinted ones; hidden everywhere; or left to DF, over the tint. Only
-        -- while ramps are tinted.
-        widgets.CycleHotkeyLabel{
-            label='Ramp overlays:', key='CUSTOM_H', options=overlay_options,
-            initial_option=state.overlays,
-            on_change=function(value)
-                state.overlays = value save_state() update_ramp_overlays() force_repaint()
-            end,
-        },
         -- Black shadows and depth fog, whatever graphics are loaded (SHADOWS
         -- AND FOG). Independent of the tint.
         toggle('Black shadows and fog:', 'CUSTOM_B', 'black_shadows'),
@@ -4862,8 +4863,7 @@ function stone_tint_command(...)
         rp.fog.kept, rp.fog.walked = 0, 0
         stats.worst_ms, stats.upkeep_worst_ms = 0, 0
         if hidden then
-            print(('stone-tint: DF\'s ramp overlays hidden (%d DF table entries), %s'):format(hidden,
-                get_state().overlays == 'tinted' and 'drawn into the ramps' or 'drawn nowhere'))
+            print(('stone-tint: DF\'s ramp overlays still hidden (%d DF table entries), being put back'):format(hidden))
         else
             print('stone-tint: ramp overlays as the graphics draw them')
         end
