@@ -285,6 +285,11 @@ if stone_tint_textures.art_count ~= ART_COUNT or not stone_tint_textures.by_sour
     stone_tint_textures = {art_count=ART_COUNT, by_source=true}
     -- Source ids name textures in the set just thrown away: start them over too.
     stone_tint_sources = nil
+    -- (PICTURES BY MEMCMP) and the pictures filed under those ids, their pixels freed
+    for _, list in pairs(stone_tint_pictures or {}) do
+        for _, filed in ipairs(list) do df.delete(filed.buf) end
+    end
+    stone_tint_pictures = nil
 end
 -- The pictures read off DF, kept beside the textures made from them so a
 -- console re-run cannot hand an id already used to another picture: the next
@@ -293,6 +298,11 @@ stone_tint_sources = stone_tint_sources or {next_id=1, data={}, by_texpos={}, by
 -- by_hash: a picture's content hash -> its id (THE ART AS DRAWN), so the same
 -- picture under a new texpos keeps its id and its textures.
 stone_tint_sources.by_hash = stone_tint_sources.by_hash or {}
+-- (1.3.7) PICTURES BY MEMCMP, at source_for: every picture read keeps a copy
+-- of its pixels, filed by its signature: signature -> list of {buf = the
+-- pixels (df.new, freed by hand), at = their address, id = its source id}.
+-- Kept and let go with the source ids it answers with.
+stone_tint_pictures = stone_tint_pictures or {}
 
 -- Resolved texposes for the strength in use: [source id] = {[colour code] =
 -- texpos, or false for "nothing to draw"}. Thrown away when the strength
@@ -1267,6 +1277,48 @@ local function read_source(px, pitch)
     return {list=list, idx=idx, hash=hash, mean={sr / cnt, sg / cnt, sb / cnt}, opaque=opaque}
 end
 
+-- PICTURES BY MEMCMP (1.3.7). DF puts some pictures together itself as it
+-- draws, ramps among them, and gives the same picture a new number after
+-- every zoom and on a level not seen before (Detailed Weather met it first:
+-- its frost.lua's RAMPS BY PICTURE and colour.lua's PICTURES BY MEMCMP, seen
+-- in play there as ramps and shores showing the game's colours on every zoom).
+-- Here a new number was a whole read, 1024 pixels through Lua (0.35 to 0.40 ms
+-- in play), at most READS_PER_FRAME a frame, and until its turn every tile
+-- showing it kept DF's own picture. So after each step of a zoom the ramps
+-- went untinted for some frames and came back, and a fast zoom, in or out,
+-- made the tint flicker off and on (seen in play 2026-11-26; that day's
+-- `stone-tint status` had 429 pictures read for 284 pictures, a third of the
+-- reads the same picture again; and offline, DF's ramps given new numbers at
+-- each zoom of a simulated view showed it frame by frame, ending with this).
+-- Now each picture read keeps a copy of its pixels (4 KB), filed by
+-- its signature, and a new number is known again by its 16 pixels and one
+-- memcmp of the whole picture against each filed under them: a check's cost,
+-- not a read's, and no read budget spent. Only a picture never seen is read.
+-- A surface whose rows are padded (pitch not 32) is read as before.
+local PICTURE_BYTES = CELL_PX * CELL_PX * 4
+-- The source id of a picture filed with these pixels, or nil.
+local function picture_known(sig, addr, pitch)
+    local memcmp = dfhack.internal.memcmp
+    if not memcmp or not addr or pitch ~= CELL_PX then return nil end
+    local list = stone_tint_pictures[sig]
+    if not list then return nil end
+    for _, filed in ipairs(list) do
+        if memcmp(filed.at, addr, PICTURE_BYTES) == 0 then return filed.id end
+    end
+    return nil
+end
+-- A picture just read, filed for picture_known under its signature.
+local function picture_file(sig, addr, pitch, id)
+    local memmove = dfhack.internal.memmove
+    if not memmove or not dfhack.internal.memcmp or not addr or pitch ~= CELL_PX then return end
+    local list = stone_tint_pictures[sig]
+    if not list then list = {} stone_tint_pictures[sig] = list end
+    local buf = df.new('uint32_t', CELL_PX * CELL_PX)
+    local _, at = df.sizeof(buf)
+    memmove(at, addr, PICTURE_BYTES)
+    list[#list + 1] = {buf = buf, at = at, id = id}
+end
+
 -- The source id for the picture a texpos shows: a positive id, false when it
 -- cannot be read (use the stored art), or nil when it waits for a later frame.
 -- Nothing is read off the texture unless this frame's budget allows: a new
@@ -1284,7 +1336,9 @@ local function source_for(texpos)
         end
         frame_checks = frame_checks - 1
         stone_tint_stats.checks = (stone_tint_stats.checks or 0) + 1
-    elseif frame_reads <= 0 or not can_work() then
+    elseif not can_work() then
+        -- (PICTURES BY MEMCMP) a new number is looked at first, within THE
+        -- FRAME'S WORK CAP only: it is read only if it is a picture never seen
         waiting[texpos] = frame_id
         return nil
     end
@@ -1295,11 +1349,20 @@ local function source_for(texpos)
         return false
     end
     local sig = signature(px, pitch)
-    this_frame.checks, this_frame.check_s = this_frame.checks + 1, this_frame.check_s + clock() - t0
     -- The same 16 pixels is the same picture, even if DF has moved it.
     if s and s.id and s.sig == sig then
+        this_frame.checks, this_frame.check_s = this_frame.checks + 1, this_frame.check_s + clock() - t0
         s.round, s.addr = source_round, addr
         return s.id
+    end
+    -- PICTURES BY MEMCMP: a picture seen before under another number (or this
+    -- number now showing another picture seen before)
+    local known = picture_known(sig, addr, pitch)
+    this_frame.checks, this_frame.check_s = this_frame.checks + 1, this_frame.check_s + clock() - t0
+    if known then
+        srcs.by_texpos[texpos] = {id=known, addr=addr, sig=sig, round=source_round}
+        stone_tint_stats.known_again = (stone_tint_stats.known_again or 0) + 1
+        return known
     end
     if frame_reads <= 0 or not can_work() then
         waiting[texpos] = frame_id
@@ -1322,6 +1385,7 @@ local function source_for(texpos)
         srcs.by_hash[data.hash] = id
         stone_tint_stats.sources = (stone_tint_stats.sources or 0) + 1
     end
+    picture_file(sig, addr, pitch, id)   -- (PICTURES BY MEMCMP)
     srcs.by_texpos[texpos] = {id=id, addr=addr, sig=sig, round=source_round}
     return id
 end
@@ -2897,8 +2961,20 @@ local function resolve_edge_pieces()
                 ss[p], us[p] = nil, nil
             end
         end
-        surf_fsid[id] = tk[5] and ss[5] or -(base + 4)
-        under_fsid[id] = tk[5] and us[5] or -(base + 4)
+        -- (1.3.7) The floor piece's own picture shifts every piece of its set
+        -- (keep's mean). While that picture waits for its read, its entry is nil
+        -- and add_piece waits with it. Until 1.3.7 `tk[5] and ss[5] or ...`
+        -- took the wait for "no picture" and gave the stored art's shift, and
+        -- every stack made then kept it for the session (stack_texpos keys a
+        -- stack by its pieces, not this shift): floor edges a shade off their
+        -- floor whenever the edges were drawn before piece 5 was read (found
+        -- offline 2026-11-26: a run with the reads unlimited and one without
+        -- settled to different edge colours, frame after frame).
+        if tk[5] then
+            surf_fsid[id], under_fsid[id] = ss[5], us[5]
+        else
+            surf_fsid[id], under_fsid[id] = -(base + 4), -(base + 4)
+        end
     end
     -- (THE QUICK FRAMES) a piece whose picture still waits for its read: the
     -- edges drawn this frame are not whole, so they are not kept (paint_edges)
@@ -3971,6 +4047,11 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
             -- (see make_texture); they are only forgotten.
             stone_tint_textures = {art_count=ART_COUNT, by_source=true}
             stone_tint_sources = {next_id=1, data={}, by_texpos={}, by_hash={}}
+            -- (PICTURES BY MEMCMP) filed under the ids just started over: freed
+            for _, list in pairs(stone_tint_pictures) do
+                for _, filed in ipairs(list) do df.delete(filed.buf) end
+            end
+            stone_tint_pictures = {}
             stone_tint_copies = {}
         else
             -- The next map's textures may sit at other numbers.
@@ -4163,8 +4244,9 @@ function stone_tint_command(...)
         print(('stone-tint: frame %.2f ms recent average, worst %.2f ms since last status; '
             .. 'overlays, shadows and fog %.2f ms, worst %.2f ms'):format(stats.frame_ms or 0,
             stats.worst_ms or 0, stats.fog_ms or 0, stats.upkeep_worst_ms or 0))
-        print(('stone-tint: so far: %d texture resets, %d pictures read, %d pictures checked')
-            :format(stats.resets or 0, stats.reads or 0, stats.checks or 0))
+        print(('stone-tint: so far: %d texture resets, %d pictures read, %d pictures checked, '
+            .. '%d known again under a new number without a read (PICTURES BY MEMCMP)')
+            :format(stats.resets or 0, stats.reads or 0, stats.checks or 0, stats.known_again or 0))
         -- What one of each costly path has cost on average (add_cost).
         local cost = stats.cost or {}
         local function each(name, label)
